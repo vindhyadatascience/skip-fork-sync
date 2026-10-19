@@ -1,0 +1,97 @@
+name: sync
+
+# Daily: for each Skip fork, if upstream has a release we have no vds/<version> branch for,
+# open a rebase PR (scripts/sync_fork.py). Manual runs can pick one fork and/or dry-run.
+
+on:
+  schedule:
+    - cron: "23 9 * * *"
+  workflow_dispatch:
+    inputs:
+      fork:
+        description: "Fork to sync"
+        type: choice
+        options: [all, skipstone, skip, skip-ui, skip-foundation, skip-lib]
+        default: all
+      dry_run:
+        description: "Dry run: print the plan, push nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: skip-fork-sync
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      forks: ${{ steps.matrix.outputs.forks }}
+    steps:
+      - id: matrix
+        env:
+          FORK: ${{ inputs.fork }}
+        run: |
+          case "${FORK:-all}" in
+            all) echo 'forks=["skipstone","skip","skip-ui","skip-foundation","skip-lib"]' >> "$GITHUB_OUTPUT" ;;
+            skipstone|skip|skip-ui|skip-foundation|skip-lib) echo "forks=[\"$FORK\"]" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::unknown fork '$FORK'"; exit 1 ;;
+          esac
+
+  sync:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: write # only to dispatch skipstone-build.yml in this repository
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        fork: ${{ fromJSON(needs.plan.outputs.forks) }}
+    steps:
+      - name: Check FORK_SYNC_TOKEN
+        env:
+          FORK_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ -z "$FORK_SYNC_TOKEN" ]; then
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "::warning::FORK_SYNC_TOKEN is not set; the dry run uses the read-only workflow token."
+            else
+              echo "::error title=FORK_SYNC_TOKEN missing::Add a repository secret named FORK_SYNC_TOKEN (Settings > Secrets and variables > Actions > New repository secret): a fine-grained PAT or GitHub App token with Contents: read and write, Pull requests: read and write, and Actions: read on vindhyadatascience/skipstone, skip, skip-ui, skip-foundation and skip-lib. See README.md."
+              exit 1
+            fi
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Sync ${{ matrix.fork }}
+        id: sync
+        env:
+          FORK_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          FALLBACK_TOKEN: ${{ github.token }}
+          FORK: ${{ matrix.fork }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if [ -z "$FORK_SYNC_TOKEN" ]; then export GH_TOKEN="$FALLBACK_TOKEN"; fi
+          args=(--fork "$FORK" --github-output)
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          python3 scripts/sync_fork.py "${args[@]}"
+
+      - name: Dispatch skipstone build
+        if: matrix.fork == 'skipstone' && steps.sync.outputs.action == 'created'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.sync.outputs.upstream_tag }}
+          REF: ${{ steps.sync.outputs.rebase_branch }}
+          PR: ${{ steps.sync.outputs.pr_number }}
+        run: |
+          gh workflow run skipstone-build.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+            -f version="$VERSION" -f ref="$REF" -f pr="$PR"

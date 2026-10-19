@@ -1,0 +1,137 @@
+name: skipstone-build
+
+# Build skip-macos.zip from a skipstone fork ref (normally a rebase/<version> branch opened by
+# sync.yml), check it transpiles identically to the stock upstream binary of the same version,
+# and attach the zip, its SHA-256 and the check summary to a DRAFT release on
+# vindhyadatascience/skipstone. This workflow never publishes a release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Upstream skipstone version, e.g. 1.9.17"
+        required: true
+      ref:
+        description: "Fork ref to build (default rebase/<version>)"
+        required: false
+        default: ""
+      vds_tag:
+        description: "Release tag for the draft (default <version>-vds.1)"
+        required: false
+        default: ""
+      pr:
+        description: "skipstone PR number to comment on (optional)"
+        required: false
+        default: ""
+      xcode:
+        description: "Xcode app to select, e.g. /Applications/Xcode_26.app (default: runner default)"
+        required: false
+        default: ""
+  repository_dispatch:
+    types: [skipstone-rebase] # client_payload: {version, ref?, vds_tag?, pr?}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: skipstone-build-${{ inputs.version || github.event.client_payload.version }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 150
+    env:
+      FORK: vindhyadatascience/skipstone
+    steps:
+      - name: Check FORK_SYNC_TOKEN
+        env:
+          FORK_SYNC_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+        run: |
+          if [ -z "$FORK_SYNC_TOKEN" ]; then
+            echo "::error title=FORK_SYNC_TOKEN missing::Add the FORK_SYNC_TOKEN repository secret (see README.md); it is needed to create the draft release on $FORK."
+            exit 1
+          fi
+
+      - name: Resolve inputs
+        id: in
+        env:
+          VERSION: ${{ inputs.version || github.event.client_payload.version }}
+          REF: ${{ inputs.ref || github.event.client_payload.ref }}
+          VDS_TAG: ${{ inputs.vds_tag || github.event.client_payload.vds_tag }}
+          PR: ${{ inputs.pr || github.event.client_payload.pr }}
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || { echo "::error::bad version '$VERSION'"; exit 1; }
+          REF=${REF:-rebase/$VERSION}; VDS_TAG=${VDS_TAG:-$VERSION-vds.1}
+          [[ "$REF" =~ ^[A-Za-z0-9._/-]+$ ]] || { echo "::error::bad ref '$REF'"; exit 1; }
+          [[ "$VDS_TAG" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?-vds\.[0-9]+$ ]] || { echo "::error::bad vds tag '$VDS_TAG'"; exit 1; }
+          [[ -z "$PR" || "$PR" =~ ^[0-9]+$ ]] || { echo "::error::bad pr '$PR'"; exit 1; }
+          { echo "version=$VERSION"; echo "ref=$REF"; echo "vds_tag=$VDS_TAG"; echo "pr=$PR"; } >> "$GITHUB_OUTPUT"
+
+      - name: Select Xcode
+        if: inputs.xcode != ''
+        env:
+          XCODE: ${{ inputs.xcode }}
+        run: sudo xcode-select -s "$XCODE"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build and check
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.in.outputs.version }}
+          REF: ${{ steps.in.outputs.ref }}
+          VDS_TAG: ${{ steps.in.outputs.vds_tag }}
+        run: |
+          set +e
+          bash scripts/skipstone_build_check.sh "$VERSION" "$REF" "$VDS_TAG" out
+          status=$?
+          cat out/check-summary.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          exit $status
+
+      - name: Attach to draft release
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          REF: ${{ steps.in.outputs.ref }}
+          VDS_TAG: ${{ steps.in.outputs.vds_tag }}
+        run: |
+          target=$(git ls-remote "https://github.com/$FORK.git" "refs/heads/$REF" | cut -f1)
+          [ -n "$target" ] || { echo "::error::$REF not found on $FORK"; exit 1; }
+          existing=$(gh api "repos/$FORK/releases" --paginate --jq ".[] | select(.tag_name == \"$VDS_TAG\") | \"\(.id) \(.draft)\"" | head -1)
+          notes=out/release-notes.md
+          { echo "CI build of \`$REF\` at \`$target\`. **Draft: review, then tag \`$VDS_TAG\` at the merged vds branch and publish manually.**"; echo; cat out/check-summary.md; } > "$notes"
+          assets=(out/skip-macos.zip out/skip-macos.zip.sha256 out/check-summary.md)
+          if [ -z "$existing" ]; then
+            gh release create "$VDS_TAG" --repo "$FORK" --draft --target "$target" \
+              --title "$VDS_TAG (draft CI build)" --notes-file "$notes" "${assets[@]}"
+          else
+            read -r id draft <<<"$existing"
+            if [ "$draft" != "true" ]; then
+              echo "::error::release $VDS_TAG on $FORK is already published; refusing to touch it"; exit 1
+            fi
+            gh api -X PATCH "repos/$FORK/releases/$id" -f body="$(cat "$notes")" -f target_commitish="$target" >/dev/null
+            for a in "${assets[@]}"; do
+              name=$(basename "$a")
+              old=$(gh api "repos/$FORK/releases/$id/assets" --jq ".[] | select(.name == \"$name\") | .id")
+              [ -n "$old" ] && gh api -X DELETE "repos/$FORK/releases/assets/$old"
+              gh api -X POST "https://uploads.github.com/repos/$FORK/releases/$id/assets?name=$name" \
+                -H "Content-Type: application/octet-stream" --input "$a" >/dev/null
+            done
+          fi
+
+      - name: Comment on the PR
+        if: always() && steps.in.outputs.pr != ''
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
+          PR: ${{ steps.in.outputs.pr }}
+          STATUS: ${{ steps.check.outputs.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$STATUS" = "0" ]; then head="skipstone-build: PASS, zip attached to a draft release."; else head="skipstone-build: FAILED or did not finish; no release was touched."; fi
+          { echo "$head Run: $RUN_URL"; echo; cat out/check-summary.md 2>/dev/null; } > comment.md
+          gh pr comment "$PR" --repo "$FORK" --body-file comment.md
