@@ -94,14 +94,25 @@ jobs:
           exit $status
 
       - name: Attach to draft release
+        id: attach
         if: success()
         env:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
           REF: ${{ steps.in.outputs.ref }}
           VDS_TAG: ${{ steps.in.outputs.vds_tag }}
         run: |
-          target=$(git ls-remote "https://github.com/$FORK.git" "refs/heads/$REF" | cut -f1)
-          [ -n "$target" ] || { echo "::error::$REF not found on $FORK"; exit 1; }
+          # The source checkout may have advanced during the build: attach only to its recorded commit.
+          target=$(python3 scripts/skipstone_artifact_check.py source-commit out/source-commit.txt) || {
+            echo "::error::No verified cloned source identity; refusing draft attachment"; exit 1;
+          }
+          # An existing tag overrides target_commitish on GitHub. Verify its peeled identity first.
+          tag_ref="refs/tags/$VDS_TAG"
+          if tag_info=$(git ls-remote --exit-code --tags "https://github.com/$FORK.git" "$tag_ref" "$tag_ref^{}"); then
+            printf '%s\n' "$tag_info" | python3 scripts/skipstone_artifact_check.py verify-tag "$tag_ref" "$target" || exit 1
+          else
+            tag_status=$?
+            [ "$tag_status" -eq 2 ] || { echo "::error::Cannot verify existing release tag; refusing draft attachment"; exit 1; }
+          fi
           existing=$(gh api "repos/$FORK/releases" --paginate --jq ".[] | select(.tag_name == \"$VDS_TAG\") | \"\(.id) \(.draft)\"" | head -1)
           notes=out/release-notes.md
           { echo "CI build of \`$REF\` at \`$target\`. **Draft: review, then tag \`$VDS_TAG\` at the merged vds branch and publish manually.**"; echo; cat out/check-summary.md; } > "$notes"
@@ -130,8 +141,15 @@ jobs:
           GH_TOKEN: ${{ secrets.FORK_SYNC_TOKEN }}
           PR: ${{ steps.in.outputs.pr }}
           STATUS: ${{ steps.check.outputs.status }}
+          ATTACHED: ${{ steps.attach.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          if [ "$STATUS" = "0" ]; then head="skipstone-build: PASS, zip attached to a draft release."; else head="skipstone-build: FAILED or did not finish; no release was touched."; fi
+          if [ "$STATUS" = "0" ] && [ "$ATTACHED" = "success" ]; then
+            head="skipstone-build: PASS, zip attached to a draft release."
+          elif [ "$STATUS" = "0" ]; then
+            head="skipstone-build: build/check PASS; draft attachment failed or was skipped. Review the run before publishing."
+          else
+            head="skipstone-build: build/check FAILED or did not finish; review the run."
+          fi
           { echo "$head Run: $RUN_URL"; echo; cat out/check-summary.md 2>/dev/null; } > comment.md
           gh pr comment "$PR" --repo "$FORK" --body-file comment.md

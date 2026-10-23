@@ -197,7 +197,7 @@ class GitHub:
 
     def find_prs(self, fork: str, head: str) -> List[dict]:
         p = self._gh("pr", "list", "--repo", fork, "--head", head, "--state", "all",
-                     "--json", "number,state,isDraft,url,body,baseRefName")
+                     "--json", "number,state,isDraft,url,body,baseRefName,mergeCommit")
         return json.loads(p.stdout or "[]")
 
     def create_pr(self, fork: str, base: str, head: str, title: str, body: str, draft: bool) -> dict:
@@ -243,7 +243,8 @@ class Patch:
 @dataclass
 class Result:
     fork: str
-    action: str = "error"  # up-to-date | created | refreshed | closed | would-create | would-refresh | error
+    action: str = "error"  # up-to-date | created | refreshed | closed | would-create | would-refresh
+    # Also manual-only / would-manual-only (no file changes), blocked (unresolved), or error.
     upstream_tag: str = ""
     upstream_source: str = ""  # "latest release" | "highest tag"
     old_branch: str = ""
@@ -362,6 +363,39 @@ def base_tag_of(g: Git, branch_ref: str, branch_version: Tuple[int, int, int],
     return max(ancestors, key=lambda t: (tags[t], t))
 
 
+def require_reviewed_patch_source(g: Git, gh: GitHub, cfg: ForkConfig,
+                                  branch: str, base_tag: str) -> None:
+    """A bot-created upstream baseline is not the accepted VDS patch queue.
+
+    Do not substitute a pending/partial rebase or silently fall back to an older branch:
+    either could omit work the maintainer has not resolved yet. A completed merge, or an
+    original patched VDS branch with no outstanding automation, remains a valid source.
+    """
+    rebase = f"rebase/{base_tag}"
+    prs = gh.find_prs(cfg.fork, rebase)
+    accepted = [p for p in prs if p.get("state") == "MERGED"]
+    for pr in accepted:
+        proof = pr.get("mergeCommit")
+        oid = proof.get("oid") if isinstance(proof, dict) else None
+        if pr.get("baseRefName") != branch:
+            raise SyncError(f"patch source {branch} needs review: merged {rebase} targeted a different or unknown base")
+        if not isinstance(oid, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+            raise SyncError(f"patch source {branch} needs review: accepted merge commit provenance is missing")
+        if not g.is_ancestor(oid, f"refs/remotes/origin/{branch}"):
+            raise SyncError(f"patch source {branch} needs review: accepted merge commit is not an ancestor of the selected source")
+    merged = bool(accepted)
+    if any(p.get("state") == "OPEN" for p in prs):
+        raise SyncError(f"patch source {branch} still needs review: {rebase} has an open PR; finish that upgrade first")
+    if any(p.get("state") == "CLOSED" for p in prs) and not merged:
+        raise SyncError(f"patch source {branch} still needs review: {rebase} was closed without merging")
+    if g.ref_exists(f"refs/remotes/origin/{rebase}") and not merged:
+        raise SyncError(f"patch source {branch} still needs review: {rebase} exists without an accepted merged PR")
+    source_tree = g.out("rev-parse", f"refs/remotes/origin/{branch}^{{tree}}")
+    base_tree = g.out("rev-parse", f"refs/upstream-tags/{base_tag}^{{tree}}")
+    if source_tree == base_tree:
+        raise SyncError(f"patch source {branch} needs review: it is a raw upstream baseline, not an established VDS patch queue")
+
+
 def patch_id(g: Git, sha: str) -> str:
     diff = g.out("show", "--format=", "--no-color", "--no-ext-diff", sha)
     if not diff:
@@ -443,21 +477,31 @@ def patch_table(res: Result) -> str:
 def manual_steps(cfg: ForkConfig, res: Result) -> str:
     new = res.upstream_tag
     tag = f"{new}{cfg.tag_sep}1"
-    steps = [
-        f"1. Resolve anything listed above on `{res.rebase_branch}`, then merge this PR into `{res.new_branch}` (merge commit or rebase; do not squash, so each patch stays one commit).",
-    ]
+    manual_only = res.action in ("manual-only", "would-manual-only")
+    if manual_only:
+        steps = [f"1. No rebase PR is needed. Manually create or review `{res.new_branch}` from upstream `{new}`; this run writes no remote branches."]
+    else:
+        steps = [
+            f"1. Resolve anything listed above on `{res.rebase_branch}`, then merge this PR into `{res.new_branch}` (merge commit or rebase; do not squash, so each patch stays one commit).",
+        ]
     regen = [h for p in res.patches if p.stamp_only for h in p.stamp_how]
     if regen:
         steps.append("2. Regenerate version stamps on `{}`:\n{}".format(
             res.new_branch, "\n".join(f"   - {h}" for h in regen)))
     else:
         steps.append("2. No version stamps to regenerate.")
-    if cfg.name == "skipstone":
+    if cfg.name == "skipstone" and manual_only:
+        steps.append(f"3. After reviewing and stamping the source, run skipstone-build manually and review its draft release `{tag}`; publishing stays manual.")
+        steps.append(f"4. Tag `{tag}` at the reviewed source commit the draft targets, then publish manually.")
+    elif cfg.name == "skipstone":
         steps.append(f"3. Review the draft release `{tag}` made by the skipstone-build workflow (binary + identical-output summary). Publishing is manual: if you rebuild after stamping, re-run that workflow first.")
         steps.append(f"4. Tag `{tag}` at the merged `{res.new_branch}` head (it must be the commit the draft release targets) and publish the release.")
     else:
         steps.append(f"3. Tag `{tag}` at the merged `{res.new_branch}` head and push the tag; create the GitHub release if this fork publishes one.")
-    steps.append(f"{len(steps) + 1}. Bump the pin in GeneFox (RNABrowser `Package.swift` / `Package.resolved`, plus any fork that pins this one, e.g. skip-foundation -> skip-lib, skip -> skipstone) to `{tag}`, and run the full gate.")
+    if cfg.tag_sep == "+vds.":
+        steps.append(f"{len(steps) + 1}. Verify the published `{tag}` tag peels to the reviewed source commit and record that full SHA. Pin that immutable `.revision(\"<verified-commit>\")` in GeneFox and consuming forks, then run the full gate. SwiftPM treats +metadata variants as the same version; do not rely on an exact version to select one, and never clear fingerprints to bypass a mismatch.")
+    else:
+        steps.append(f"{len(steps) + 1}. Verify `{tag}` peels to the reviewed source commit. Bump GeneFox's exact-version pin to `{tag}` (skip-ui uses `.exact(\"{tag}\")`); update any consuming fork/tap and run the full gate.")
     return "\n".join(steps)
 
 
@@ -524,15 +568,19 @@ def plan_text(cfg: ForkConfig, res: Result) -> str:
         lines.append(f"   patches from: {res.old_branch} (base {res.base_tag}), {len(res.patches)} patch(es)")
     elif res.old_branch:
         lines.append(f"   our newest branch: {res.old_branch}")
-    if res.action in ("would-create", "created", "refreshed", "would-refresh"):
+    if res.action in ("would-create", "created", "refreshed", "would-refresh",
+                      "manual-only", "would-manual-only", "blocked"):
         lines.append(f"   upstream changes since base: {res.upstream_count} commits ({res.compare_url})")
         lines.append(f"   branches: {res.new_branch} @ {res.upstream_tag}, {res.rebase_branch}")
         for i, p in enumerate(res.patches, 1):
             extra = f" [{', '.join(p.files)}]" if p.files and p.status in ("conflict", "missing") else ""
             pins = " [pins]" if p.has_pins else ""
             lines.append(f"   {i}. {p.sha[:10]} {STATUS_TEXT.get(p.status, p.status)}{extra}{pins}: {p.subject}")
-        lines.append(f"   PR: {'DRAFT ' if res.conflicts else ''}{res.rebase_branch} -> {res.new_branch}"
-                     + (f" {res.pr_url}" if res.pr_url else ""))
+        if res.action in ("manual-only", "would-manual-only", "blocked"):
+            lines.append("   no rebase PR or remote branches written by this run")
+        else:
+            lines.append(f"   PR: {'DRAFT ' if res.conflicts else ''}{res.rebase_branch} -> {res.new_branch}"
+                         + (f" {res.pr_url}" if res.pr_url else ""))
     return "\n".join(lines)
 
 
@@ -637,6 +685,7 @@ def _sync(cfg: ForkConfig, gh: GitHub, opts: Options, g: Git, res: Result) -> No
     res.old_branch = max(older, key=lambda b: (older[b], b))
     old_ref = f"refs/remotes/origin/{res.old_branch}"
     res.base_tag = base_tag_of(g, old_ref, older[res.old_branch], tags)
+    require_reviewed_patch_source(g, gh, cfg, res.old_branch, res.base_tag)
     base_ref = f"refs/upstream-tags/{res.base_tag}"
 
     res.skipped_merges = len(g.lines("rev-list", "--merges", f"{base_ref}..{old_ref}"))
@@ -663,9 +712,28 @@ def _apply_all(g: Git, res: Result, start: str) -> None:
     res.rebase_head = g.out("rev-parse", "HEAD")
 
 
+def no_code_rebase(g: Git, opts: Options, res: Result, base: str) -> bool:
+    """No empty PRs, including safe retries after a prior run pushed equal refs.
+
+    Leave all remote refs alone. Regeneration is a manual follow-up, while a queue with
+    unresolved code must stay visibly blocked rather than masquerading as up to date.
+    """
+    if g.out("rev-parse", res.rebase_head + "^{tree}") != g.out("rev-parse", base + "^{tree}"):
+        return False
+    if res.conflicts:
+        res.action = "blocked"
+        res.message = "No file changes survived and code patches remain unresolved; review the listed patches manually. Remote refs retained."
+    else:
+        res.action = "would-manual-only" if opts.dry_run else "manual-only"
+        res.message = "No file changes remain after dropping upstream/stamp-only patches; no empty PR is created. Version regeneration and release remain manual."
+    return True
+
+
 def _create(cfg: ForkConfig, gh: GitHub, opts: Options, g: Git, res: Result, new_commit: str) -> None:
     _apply_all(g, res, new_commit)
     res.draft = bool(res.conflicts)
+    if no_code_rebase(g, opts, res, new_commit):
+        return
     if opts.dry_run:
         res.action = "would-create"
         return
@@ -713,6 +781,8 @@ def _refresh(cfg: ForkConfig, gh: GitHub, opts: Options, g: Git, res: Result, op
             elif trial.status == "applied":
                 p.note = "applies cleanly on the current branch head: `git cherry-pick -x " + p.sha[:12] + "`"
     res.draft = bool(res.conflicts)
+    if open_pr is None and no_code_rebase(g, opts, res, new_ref):
+        return
     if opts.dry_run:
         res.action = "would-refresh"
         if open_pr:
@@ -796,7 +866,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except SyncError as e:
             res = Result(fork=name, action="error", message=str(e))
             failed = True
+        if res.action == "blocked":
+            failed = True
         text = plan_text(cfg, res)
+        if res.action in ("manual-only", "would-manual-only"):
+            text += "\n\n--- Manual follow-up ---\n" + manual_steps(cfg, res)
         if args.dry_run and res.action in ("would-create", "would-refresh"):
             text += "\n\n--- PR body that would be used ---\n" + pr_body(cfg, res)
         print(text + "\n", flush=True)

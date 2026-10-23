@@ -37,6 +37,21 @@ Each fork holds only `main` (a pure mirror of upstream) and our `vds/<upstream v
    `vds/<new>` branch means up to date. A PR closed without merging stops the bot for that version until
    you delete `rebase/<new>` and `vds/<new>`.
 
+If dropping version stamps and patches already upstream leaves no file changes, the result is
+`manual-only` (`would-manual-only` for a dry run): no empty PR, branch push, or fork-main sync is
+attempted. The output retains the patch statuses and manual version-regeneration/release steps.
+Existing equal branches left by an earlier failed PR attempt are preserved on retry. If no file
+changes survive but code patches still conflict or are missing, the result is `blocked` and the
+command exits nonzero without remote writes; resolve the reported queue manually.
+
+A newer release must not use an unfinished upgrade's raw `vds/<version>` base as its patch source.
+The bot refuses a source whose previous rebase is open, closed without merging, or orphaned without
+an accepted merged PR. Acceptance must name that source branch as `baseRefName` and provide a
+merge commit that is an ancestor of the selected source; missing provenance fails closed.
+A source identical to its upstream base is also ambiguous and requires review. Finish and review that upgrade first; the bot neither substitutes a partial `rebase/*`
+branch nor silently skips back to an older patch queue. Original patched VDS source branches and
+completed merged upgrades remain usable.
+
 Patches that only change version stamps are not cherry-picked, because their values would be wrong for
 the new version. They are listed as **regenerate after build**:
 
@@ -53,9 +68,18 @@ identical-output check (`scripts/skipstone_build_check.sh`): sample packages (sk
 skip-foundation at their latest releases) are built with the stock upstream binary of the same version
 (checksum-verified against upstream skip's pin) and with ours, and the generated trees under
 `.build/plugins/outputs` must be identical apart from the skipstone version string in the
-`.sourcehash` markers. On a pass it attaches `skip-macos.zip`, `skip-macos.zip.sha256` and
+`.sourcehash` markers. Only the top-level `skipstone` version field in a valid per-module
+`.sourcehash` JSON marker is normalized. A marker needs a nonempty module name, unique root
+`skipstone` and `sourcehashes` fields, and a dictionary hash map; unexpected or duplicate shapes
+remain exact. Code, scientific outputs, binary bytes, nested fields and symlink targets remain exact. On a pass it attaches `skip-macos.zip`, `skip-macos.zip.sha256` and
 `check-summary.md` to a **draft** release `<new>-vds.1` on vindhyadatascience/skipstone, and comments on
-the PR. It never publishes. You can also run it by hand (Actions > skipstone-build > Run workflow, or a
+the PR. It never publishes. The source clone records its full commit in `out/source-commit.txt` before
+building; draft attachment consumes that immutable identity without re-resolving the branch.
+Local `VDS_ZIP` checks clear any stale source identity and cannot attach a falsely attributed draft.
+Missing or malformed source identity refuses attachment. An existing lightweight or annotated
+release tag must peel to that same commit before any draft/asset mutation; tag lookup errors
+refuse attachment, while a confirmed absent tag is allowed. Tags are never moved. You can also run it by hand
+(Actions > skipstone-build > Run workflow, or a
 `repository_dispatch` of type `skipstone-rebase` with `client_payload: {version, ref, vds_tag, pr}`).
 
 ## The token: `FORK_SYNC_TOKEN`
@@ -106,7 +130,11 @@ python3 scripts/sync_fork.py --dry-run --rehearse             # pretend vds/<lat
 
 The dry run does the cherry-picks in a scratch clone, so its conflict predictions are exact.
 
-Tests (local bare-repo fixtures; no network):
+Every sample must contain generated Kotlin, not just markers. Resolve/edit/build/find/manifest
+failures propagate explicitly through conditional shell calls. Each attempt discards its stale
+manifest, and only a successful helper installs a fresh manifest by atomic rename.
+
+Tests (local bare-repo and command-stub fixtures; no network or compiler builds):
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -131,6 +159,10 @@ python3 -m unittest discover -s tests -v
      `<new>-vds.1`.
    - others: `git tag <new>-vds.1` (skip-ui) or `git tag '<new>+vds.1'` (skip, skip-foundation,
      skip-lib) at the merged `vds/<new>` head and push it.
-5. Bump the pins in GeneFox (RNABrowser `Package.swift` / `Package.resolved`, and the Homebrew tap for
-   skipstone) and run the full gate.
+5. Verify each published tag peels to the reviewed source commit and record its full SHA.
+   For metadata-tagged forks (`skip`, `skip-lib`, `skip-foundation`, tags `+vds.N`), use that
+   immutable `.revision("<verified-commit>")` in GeneFox and consuming forks: SwiftPM compares
+   metadata variants as the same version, so an exact version does not select the variant.
+   Never clear fingerprints to bypass a revision mismatch. `skip-ui` keeps its exact
+   prerelease-version pin (`-vds.N`). Update the Homebrew tap for skipstone and run the full gate.
 6. Once GeneFox is on the new version, delete the superseded `vds/<old>` branch (its tags stay).

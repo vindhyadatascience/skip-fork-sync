@@ -19,9 +19,14 @@
 # .sourcehash markers ("skipstone":"<vds tag>" vs "skipstone":"<version>"), which is normalised.
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+ARTIFACT_CHECK="$SCRIPT_DIR/skipstone_artifact_check.py"
 VERSION=${1:?version}; REF=${2:?ref}; VDS_TAG=${3:?vds tag}; OUT=${4:?out dir}
 SAMPLES=${SAMPLES:-"skip-lib skip-foundation"}
 mkdir -p "$OUT/logs"; OUT=$(cd "$OUT" && pwd)
+SOURCE_IDENTITY="$OUT/source-commit.txt"
+# A reused output directory must never attribute a prebuilt zip to an earlier source build.
+rm -f "$SOURCE_IDENTITY"
 WORK=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/skipstone-check.XXXXXX")
 SUMMARY="$OUT/check-summary.md"
 log() { echo "== $*" >&2; }
@@ -44,6 +49,7 @@ else
   git clone --quiet --branch "$REF" --recurse-submodules https://github.com/vindhyadatascience/skipstone.git "$WORK/skipstone"
   cd "$WORK/skipstone"
   SRC_SHA=$(git rev-parse HEAD)
+  python3 "$ARTIFACT_CHECK" record-source "$SOURCE_IDENTITY" "$SRC_SHA"
   echo "- source commit: \`$SRC_SHA\`" >> "$SUMMARY"
   STAMP_FILE=Sources/SkipSyntax/Version.swift
   if ! grep -q "skipVersion = \"$VDS_TAG\"" "$STAMP_FILE"; then
@@ -90,23 +96,39 @@ make_skip_copy "$WORK/skip-stock" "$WORK/stock-skip-macos.zip"
 make_skip_copy "$WORK/skip-vds" "$OUT/skip-macos.zip"
 
 manifest() { # <outputs dir> <out file>
-  (cd "$1" && find . \( -path '*/.build' -o -path '*/.gradle' \) -prune -o \( -type f -o -type l \) -print | LC_ALL=C sort | while IFS= read -r p; do
-    if [ -L "$p" ]; then echo "L $p -> $(readlink "$p")"
-    else echo "F $(LC_ALL=C sed "s/\"skipstone\":\"$VDS_TAG\"/\"skipstone\":\"$VERSION\"/g" "$p" | shasum -a 256 | cut -d' ' -f1) $p"; fi
-  done) > "$2"
+  local destination=$2 staging
+  rm -f "$destination" || return 1
+  staging=$(mktemp "${destination}.tmp.XXXXXX") || return 1
+  if ! python3 "$ARTIFACT_CHECK" manifest "$1" "$staging" "$VERSION" "$VDS_TAG"; then
+    rm -f "$staging"
+    return 1
+  fi
+  if ! mv -f "$staging" "$destination"; then
+    rm -f "$staging"
+    return 1
+  fi
 }
 
 run_variant() { # <sample dir> <variant>
-  local dir=$1 variant=$2
-  (cd "$dir"
-   rm -rf .build
-   swift package resolve
-   swift package edit skip --path "$WORK/skip-$variant"
-   swift build --build-tests
-   find .build/artifacts -maxdepth 5 | head -20
-  ) > "$OUT/logs/$(basename "$dir")-$variant.log" 2>&1 || { tail -40 "$OUT/logs/$(basename "$dir")-$variant.log"; return 1; }
-  manifest "$dir/.build/plugins/outputs" "$OUT/logs/$(basename "$dir")-$variant.manifest"
-  (cd "$dir" && swift package unedit skip --force >/dev/null 2>&1 || true)
+  local dir=$1 variant=$2 status=0 manifest_path log_path
+  manifest_path="$OUT/logs/$(basename "$dir")-$variant.manifest"
+  log_path="$OUT/logs/$(basename "$dir")-$variant.log"
+  # This function is called by if !, so errexit cannot propagate failures for us.
+  rm -f "$manifest_path" || return 1
+  if ! (cd "$dir" || exit 1
+    rm -rf .build || exit 1
+    swift package resolve || exit 1
+    swift package edit skip --path "$WORK/skip-$variant" || exit 1
+    swift build --build-tests || exit 1
+    find .build/artifacts -maxdepth 5 | sed -n '1,20p' || exit 1
+  ) > "$log_path" 2>&1; then
+    tail -40 "$log_path" || true
+    status=1
+  elif ! manifest "$dir/.build/plugins/outputs" "$manifest_path"; then
+    status=1
+  fi
+  (cd "$dir" && swift package unedit skip --force >/dev/null 2>&1) || true
+  return "$status"
 }
 
 STATUS=0
@@ -118,10 +140,10 @@ for s in $SAMPLES; do
   if ! run_variant "$WORK/$s" stock || ! run_variant "$WORK/$s" vds; then
     echo "- FAIL \`$s@$tag\`: build failed (see logs)" >> "$SUMMARY"; STATUS=1; continue
   fi
-  files=$(wc -l < "$OUT/logs/$s-stock.manifest" | tr -d ' ')
-  kt=$(grep -c '\.kt$' "$OUT/logs/$s-stock.manifest" || true)
-  if [ "$files" -eq 0 ]; then
-    echo "- FAIL \`$s@$tag\`: no generated files (the plugin did not run)" >> "$SUMMARY"; STATUS=1
+  files=$(wc -l < "$OUT/logs/$s-stock.manifest" | tr -d ' ') || { echo "- FAIL: manifest count failed" >> "$SUMMARY"; STATUS=1; continue; }
+  kt=$(python3 "$ARTIFACT_CHECK" count-kotlin "$OUT/logs/$s-stock.manifest") || { echo "- FAIL: Kotlin count failed" >> "$SUMMARY"; STATUS=1; continue; }
+  if [ "$files" -eq 0 ] || [ "$kt" -eq 0 ]; then
+    echo "- FAIL \`$s@$tag\`: no generated Kotlin files (the plugin did not transpile code)" >> "$SUMMARY"; STATUS=1
   elif diff "$OUT/logs/$s-stock.manifest" "$OUT/logs/$s-vds.manifest" > "$OUT/logs/$s.diff"; then
     echo "- PASS \`$s@$tag\`: $files generated files ($kt .kt) identical after normalising the skipstone version string" >> "$SUMMARY"
   else

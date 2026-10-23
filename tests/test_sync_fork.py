@@ -72,9 +72,11 @@ class FakeGitHub(sf.GitHub):
 
     def create_pr(self, fork, base, head, title, body, draft):
         self.calls.append(("create_pr", head, draft))
+        if not git(self.repo_url(fork), "rev-list", f"refs/heads/{base}..refs/heads/{head}"):
+            raise sf.SyncError("No commits between PR base and head")
         n = len(self.prs) + 1
         pr = {"number": n, "url": f"https://example/pr/{n}", "state": "OPEN", "isDraft": draft,
-              "body": body, "head": head, "base": base, "title": title}
+              "body": body, "head": head, "base": base, "baseRefName": base, "mergeCommit": None, "title": title}
         self.prs.append(pr)
         return dict(pr)
 
@@ -105,7 +107,8 @@ class Fixture:
     """upstream: 1.0.0 -> 1.1.0 (optionally touching a file our patch touches).
     fork: main = upstream main at 1.0.0; vds/1.0 = 1.0.0 + [code patch, stamp patch, doc patch]."""
 
-    def __init__(self, conflict=False, upstream_has_patch=False, extra_upstream_tags=()):
+    def __init__(self, conflict=False, upstream_has_patch=False, extra_upstream_tags=(),
+                 stamp_only=False, omit_doc=False):
         self.root = tempfile.mkdtemp(prefix="sfs-test-")
         self.gh = FakeGitHub(self.root)
         self.up_bare = self.gh.repo_url(FORK_CFG.upstream)
@@ -120,9 +123,9 @@ class Fixture:
         git(work, "tag", "1.0.0")
         # Our patches on vds/1.0 (two-component branch name on purpose).
         git(work, "checkout", "-q", "-b", "vds/1.0")
-        self.p_code = commit(work, "VDS: code patch", {"a.txt": "line1\nPATCHED\nline3\n"})
+        self.p_code = None if stamp_only else commit(work, "VDS: code patch", {"a.txt": "line1\nPATCHED\nline3\n"})
         self.p_stamp = commit(work, "VDS: stamp skipVersion", {VERSION_SWIFT: 'public let skipVersion = "1.0.0-vds.1"\n'})
-        self.p_doc = commit(work, "VDS: build doc", {"VDS-BUILD.md": "how we build\n"})
+        self.p_doc = None if stamp_only or omit_doc else commit(work, "VDS: build doc", {"VDS-BUILD.md": "how we build\n"})
         git(work, "tag", "1.0.0-vds.1")
         git(work, "checkout", "-q", "main")
         files = {VERSION_SWIFT: 'public let skipVersion = "1.1.0"\n', "new.txt": "feature\n"}
@@ -346,6 +349,154 @@ class TestIdempotency(Base):
         res = fx.run(dry_run=True, rehearse=True)
         self.assertEqual(res.action, "would-create")
         self.assertEqual(fx.fork_refs(), refs)
+
+
+class TestNoCodeRebase(Base):
+    def assert_no_remote_writes(self, fx, before_refs, calls_from=0):
+        self.assertEqual(fx.fork_refs(), before_refs)
+        writes = {"sync", "create_pr", "create_comment", "edit_pr_body", "edit_comment"}
+        self.assertFalse([c for c in fx.gh.calls[calls_from:] if c[0] in writes])
+
+    def test_stamp_only_is_manual_followup_without_empty_pr_and_safe_to_repeat(self):
+        fx = self.make(stamp_only=True)
+        before = fx.fork_refs()
+        for _ in range(2):
+            res = fx.run()
+            self.assertEqual(res.action, "manual-only")
+            self.assertEqual([p.status for p in res.patches], ["regenerate-after-build"])
+            self.assertIn("skipVersion", sf.manual_steps(FORK_CFG, res))
+            self.assertIn("no rebase PR", sf.plan_text(FORK_CFG, res))
+            self.assert_no_remote_writes(fx, before)
+
+    def test_stamp_only_dry_run_reports_manual_followup_without_mutations(self):
+        fx = self.make(stamp_only=True)
+        before = fx.fork_refs()
+        res = fx.run(dry_run=True)
+        self.assertEqual(res.action, "would-manual-only")
+        self.assertIn("regenerate after build", sf.plan_text(FORK_CFG, res))
+        self.assert_no_remote_writes(fx, before)
+
+    def test_preexisting_equal_refs_from_failed_pr_are_not_rewritten(self):
+        fx = self.make(stamp_only=True)
+        git(fx.work, "push", "-q", fx.fork_bare,
+            "1.1.0^{commit}:refs/heads/vds/1.1.0",
+            "1.1.0^{commit}:refs/heads/rebase/1.1.0")
+        before = fx.fork_refs()
+        for dry_run, action in [(False, "manual-only"), (True, "would-manual-only")]:
+            res = fx.run(dry_run=dry_run)
+            self.assertEqual(res.action, action)
+            self.assert_no_remote_writes(fx, before)
+
+    def test_all_code_already_upstream_has_no_empty_pr(self):
+        fx = self.make(upstream_has_patch=True, omit_doc=True)
+        before = fx.fork_refs()
+        res = fx.run()
+        self.assertEqual(res.action, "manual-only")
+        self.assertEqual([p.status for p in res.patches], ["already-upstream", "regenerate-after-build"])
+        self.assert_no_remote_writes(fx, before)
+
+    def test_all_code_conflicts_is_blocked_without_empty_draft_pr(self):
+        fx = self.make(conflict=True, omit_doc=True)
+        before = fx.fork_refs()
+        res = fx.run()
+        self.assertEqual(res.action, "blocked")
+        self.assertEqual(res.patches[0].files, ["a.txt"])
+        self.assertIn("CONFLICT", sf.plan_text(FORK_CFG, res))
+        self.assert_no_remote_writes(fx, before)
+
+
+class TestPatchSourceTrust(Base):
+    def assert_source_blocked(self, fx):
+        before = fx.fork_refs()
+        calls_from = len(fx.gh.calls)
+        for dry_run in (False, True):
+            with self.assertRaisesRegex(sf.SyncError, "source.*review|review.*source"):
+                fx.run(latest="1.2.0", dry_run=dry_run)
+        self.assertEqual(fx.fork_refs(), before)
+        writes = {"sync", "create_pr", "create_comment", "edit_pr_body", "edit_comment"}
+        self.assertFalse([c for c in fx.gh.calls[calls_from:] if c[0] in writes])
+
+    def test_pending_previous_rebase_cannot_replace_real_patch_source(self):
+        fx = self.make(extra_upstream_tags=("1.2.0",))
+        fx.run(latest="1.1.0")
+        self.assert_source_blocked(fx)
+
+    def test_conflicted_partial_rebase_is_not_a_trusted_source(self):
+        fx = self.make(conflict=True, extra_upstream_tags=("1.2.0",))
+        first = fx.run(latest="1.1.0")
+        self.assertTrue(first.draft)
+        self.assert_source_blocked(fx)
+
+    def test_raw_vds_baseline_without_pr_or_rebase_is_ambiguous(self):
+        fx = self.make(extra_upstream_tags=("1.2.0",))
+        git(fx.work, "push", "-q", fx.fork_bare, "1.1.0^{commit}:refs/heads/vds/1.1.0")
+        self.assert_source_blocked(fx)
+
+    def test_orphaned_rebase_without_pr_is_ambiguous(self):
+        fx = self.make(extra_upstream_tags=("1.2.0",))
+        fx.run(latest="1.1.0")
+        fx.gh.prs.clear()
+        self.assert_source_blocked(fx)
+
+    def test_closed_unmerged_previous_rebase_is_not_accepted(self):
+        fx = self.make(extra_upstream_tags=("1.2.0",))
+        fx.run(latest="1.1.0")
+        fx.gh.prs[0]["state"] = "CLOSED"
+        self.assert_source_blocked(fx)
+
+    def reviewed_source(self):
+        fx = self.make(extra_upstream_tags=("1.2.0",))
+        fx.run(latest="1.1.0")
+        git(fx.work, "fetch", "-q", fx.fork_bare, "refs/heads/rebase/1.1.0")
+        git(fx.work, "push", "-q", fx.fork_bare, "FETCH_HEAD:refs/heads/vds/1.1.0")
+        fx.gh.prs[0].update(state="MERGED", mergeCommit={"oid": git(fx.fork_bare, "rev-parse", "vds/1.1.0")})
+        return fx
+
+    def test_merged_pr_for_wrong_base_does_not_authorize_source(self):
+        fx = self.reviewed_source()
+        fx.gh.prs[0]["baseRefName"] = "main"
+        self.assert_source_blocked(fx)
+
+    def test_merged_commit_must_be_ancestor_of_selected_source(self):
+        fx = self.reviewed_source()
+        fx.gh.prs[0]["mergeCommit"] = {"oid": git(fx.up_bare, "rev-parse", "1.2.0")}
+        self.assert_source_blocked(fx)
+
+    def test_missing_merge_provenance_fails_closed(self):
+        fx = self.reviewed_source()
+        fx.gh.prs[0]["mergeCommit"] = None
+        self.assert_source_blocked(fx)
+
+    def test_merged_patch_source_carries_the_real_queue_forward(self):
+        fx = self.make(extra_upstream_tags=("1.2.0",))
+        fx.run(latest="1.1.0")
+        git(fx.work, "fetch", "-q", fx.fork_bare, "refs/heads/rebase/1.1.0")
+        git(fx.work, "push", "-q", fx.fork_bare, "FETCH_HEAD:refs/heads/vds/1.1.0")
+        fx.gh.prs[0].update(state="MERGED", mergeCommit={"oid": git(fx.fork_bare, "rev-parse", "vds/1.1.0")})
+        res = fx.run(latest="1.2.0")
+        self.assertEqual(res.action, "created")
+        self.assertEqual(res.old_branch, "vds/1.1.0")
+        self.assertEqual([p.subject for p in res.patches], ["VDS: code patch", "VDS: build doc"])
+        self.assertTrue(all(p.status == "applied" for p in res.patches))
+
+
+class TestPinGuidance(unittest.TestCase):
+    def result(self):
+        return sf.Result(fork="fixture", upstream_tag="1.5.0", new_branch="vds/1.5.0",
+                         rebase_branch="rebase/1.5.0", action="created")
+
+    def test_metadata_variants_require_verified_immutable_revision_pins(self):
+        for fork in ("skip", "skip-lib", "skip-foundation"):
+            text = sf.manual_steps(sf.FORKS[fork], self.result())
+            self.assertIn('.revision("<verified-commit>")', text)
+            self.assertIn("peels to the reviewed source commit", text)
+            self.assertIn("never clear fingerprints", text)
+            self.assertNotIn('.exact(', text)
+
+    def test_skip_ui_keeps_exact_prerelease_version_guidance(self):
+        text = sf.manual_steps(sf.FORKS["skip-ui"], self.result())
+        self.assertIn('.exact("1.5.0-vds.1")', text)
+        self.assertIn("peels to the reviewed source commit", text)
 
 
 class TestCli(unittest.TestCase):
