@@ -4,11 +4,15 @@ Run: python3 -m unittest discover -s tests -v
 """
 
 import os
+import contextlib
+import io
+import json
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 import sync_fork as sf  # noqa: E402
@@ -485,18 +489,135 @@ class TestPinGuidance(unittest.TestCase):
         return sf.Result(fork="fixture", upstream_tag="1.5.0", new_branch="vds/1.5.0",
                          rebase_branch="rebase/1.5.0", action="created")
 
-    def test_metadata_variants_require_verified_immutable_revision_pins(self):
-        for fork in ("skip", "skip-lib", "skip-foundation"):
-            text = sf.manual_steps(sf.FORKS[fork], self.result())
+    def test_every_fork_tags_prereleases_and_pins_verified_revisions(self):
+        for fork in ("skip", "skip-lib", "skip-foundation", "skip-unit", "skip-ui"):
+            cfg = sf.FORKS[fork]
+            self.assertEqual(cfg.tag_sep, "-vds.", fork)
+            text = sf.manual_steps(cfg, self.result())
+            self.assertIn("`1.5.0-vds.1`", text)
+            self.assertNotIn("+vds.", text)
             self.assertIn('.revision("<verified-commit>")', text)
             self.assertIn("peels to the reviewed source commit", text)
-            self.assertIn("never clear fingerprints", text)
+            self.assertIn("Never clear fingerprints", text)
             self.assertNotIn('.exact(', text)
 
-    def test_skip_ui_keeps_exact_prerelease_version_guidance(self):
-        text = sf.manual_steps(sf.FORKS["skip-ui"], self.result())
-        self.assertIn('.exact("1.5.0-vds.1")', text)
-        self.assertIn("peels to the reviewed source commit", text)
+    def test_no_fork_uses_metadata_tags(self):
+        self.assertEqual({c.tag_sep for c in sf.FORKS.values()}, {"-vds."})
+
+
+class TestSkipPinCommits(unittest.TestCase):
+    # The lines aff2bbe6b8 ("Pin every compiler platform to VDS 1.9.19-vds.5") changed in skip's
+    # Package.swift. Before SKIP_SOURCE_PIN the revision line made it look like code, so every
+    # pin commit was cherry-picked onto 1.9.20 and conflicted (skip-fork-sync run 40199125668).
+    PIN_LINES = [
+        '    package.targets += [.binaryTarget(name: "skip", url: "https://github.com/vindhyadatascience/skipstone/releases/download/1.9.19-vds.5/skip-macos.zip", checksum: "de6b")]',
+        '    package.targets += [.binaryTarget(name: "skip", url: "https://github.com/vindhyadatascience/skipstone/releases/download/1.9.19-vds.5/skip-linux.zip", checksum: "f42c")]',
+        '    package.dependencies += [.package(url: "https://github.com/vindhyadatascience/skipstone.git", revision: "ec9bad48a4153314236d6cd77636fa3c010bcdcf")]',
+    ]
+
+    def classify(self, lines):
+        changed = [("Package.swift", line) for line in lines]
+        with mock.patch.object(sf, "changed_lines", return_value=changed), \
+             mock.patch.object(sf.Git, "out", return_value="pin commit", create=True):
+            return sf.classify_patch(sf.Git.__new__(sf.Git), sf.FORKS["skip"], "abc", "1.9.20")
+
+    def test_a_commit_moving_only_binary_and_source_pins_is_regenerated(self):
+        p = self.classify(self.PIN_LINES)
+        self.assertTrue(p.stamp_only)
+        self.assertFalse(p.has_pins)
+        self.assertTrue(any("skipstone source dependency" in h for h in p.stamp_how))
+        self.assertTrue(any("skip-linux.zip" in h for h in p.stamp_how))
+
+    def test_without_the_source_pin_rule_the_same_commit_counts_as_code(self):
+        cfg = sf.FORKS["skip"]
+        narrowed = sf.ForkConfig(cfg.name, cfg.upstream, cfg.fork, cfg.tag_sep, (sf.SKIP_STAMP,))
+        changed = [("Package.swift", line) for line in self.PIN_LINES]
+        with mock.patch.object(sf, "changed_lines", return_value=changed), \
+             mock.patch.object(sf.Git, "out", return_value="pin commit", create=True):
+            p = sf.classify_patch(sf.Git.__new__(sf.Git), narrowed, "abc", "1.9.20")
+        self.assertFalse(p.stamp_only)
+
+    def test_a_real_code_line_alongside_pins_is_still_code(self):
+        p = self.classify(self.PIN_LINES + ['    platforms: [.macOS(.v14)],'])
+        self.assertFalse(p.stamp_only)
+
+
+class TestMixedPinPatch(unittest.TestCase):
+    """A patch that moves pins AND carries other changes (50c3096c13 added the fork README)."""
+    PIN = '    package.dependencies += [.package(url: "https://github.com/vindhyadatascience/skipstone.git", revision: "{}")]\n'
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="sfs-mixed-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        git(self.root, "init", "-q", "-b", "main")
+        commit(self.root, "base", {"Package.swift": self.PIN.format("aaa"), "README.md": "upstream\n"})
+        git(self.root, "checkout", "-q", "-b", "vds")
+        self.sha = commit(self.root, "pins + readme", {"Package.swift": self.PIN.format("bbb"),
+                                                       "README.md": "upstream\nfork notice\n"})
+        git(self.root, "checkout", "-q", "main")
+        commit(self.root, "upstream moves the manifest", {"Package.swift": self.PIN.format("ccc")})
+        self.g = sf.Git(self.root, ENV)
+
+    def test_classifies_the_manifest_as_stamp_only_and_applies_the_rest(self):
+        p = sf.classify_patch(self.g, sf.FORKS["skip"], self.sha, "1.9.20")
+        self.assertFalse(p.stamp_only)
+        self.assertEqual(p.stamp_files, ["Package.swift"])
+        sf.try_pick(self.g, p)
+        self.assertEqual(p.status, "applied")
+        with open(os.path.join(self.root, "README.md")) as f:
+            self.assertIn("fork notice", f.read())
+        with open(os.path.join(self.root, "Package.swift")) as f:
+            self.assertIn('revision: "ccc"', f.read())  # upstream's pin kept; regenerated later
+        self.assertEqual(git(self.root, "status", "--porcelain").strip(), "")
+
+    def test_without_stamp_files_the_same_patch_conflicts(self):
+        p = sf.classify_patch(self.g, sf.FORKS["skip"], self.sha, "1.9.20")
+        p.stamp_files = []
+        sf.try_pick(self.g, p)
+        self.assertEqual(p.status, "conflict")
+
+
+class TestUnitForkInventory(unittest.TestCase):
+    def test_unit_uses_its_actual_upstream_and_prerelease_tags(self):
+        cfg = sf.FORKS["skip-unit"]
+        self.assertEqual(cfg.upstream, "skiptools/skip-unit")
+        self.assertEqual(cfg.fork, "vindhyadatascience/skip-unit")
+        self.assertEqual(cfg.tag_sep, "-vds.")
+        self.assertEqual(cfg.stamp_rules, ())
+
+    def test_cli_selects_unit_once_without_selecting_or_contacting_other_forks(self):
+        selected = []
+        def sync(cfg, gh, opts):
+            selected.append((cfg, opts.dry_run))
+            return sf.Result(fork=cfg.name, action="up-to-date")
+        with mock.patch.object(sf, "sync_fork", side_effect=sync), \
+             mock.patch.object(sf, "GitHub"), \
+             mock.patch.object(sf, "write_step_summary"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            result = sf.main(["--fork", "skip-unit", "--fork", "skip-unit", "--dry-run"])
+        self.assertEqual(result, 0)
+        self.assertEqual(selected, [(sf.FORKS["skip-unit"], True)])
+
+    def test_actual_workflow_matrix_accepts_unit_and_includes_it_in_all(self):
+        workflow = os.path.join(os.path.dirname(__file__), "..", ".github", "workflows", "sync.yml")
+        with open(workflow) as file:
+            text = file.read()
+        self.assertIn("options: [all, skipstone, skip, skip-ui, skip-foundation, skip-lib, skip-unit]", text)
+        case = text[text.index('case "${FORK:-all}" in'):]
+        case = case[:case.index("esac") + len("esac")]
+        with tempfile.TemporaryDirectory(prefix="sfs-unit-matrix-") as directory:
+            for selected, expected in [("skip-unit", ["skip-unit"]), ("all", list(sf.FORKS))]:
+                output = os.path.join(directory, selected + ".txt")
+                env = dict(os.environ, FORK=selected, GITHUB_OUTPUT=output)
+                result = subprocess.run(["/bin/bash", "-e", "-c", case], env=env, text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                with open(output) as file:
+                    self.assertEqual(json.loads(file.read().removeprefix("forks=")), expected)
+            output = os.path.join(directory, "unknown.txt")
+            result = subprocess.run(["/bin/bash", "-e", "-c", case],
+                env=dict(os.environ, FORK="unknown", GITHUB_OUTPUT=output), text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(os.path.exists(output))
 
 
 class TestCli(unittest.TestCase):

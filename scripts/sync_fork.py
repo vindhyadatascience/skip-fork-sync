@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Open rebase PRs in the vindhyadatascience Skip forks when upstream releases.
 
-For each fork (skipstone, skip, skip-ui, skip-foundation, skip-lib):
+For each fork (skipstone, skip, skip-ui, skip-foundation, skip-lib, skip-unit):
 
 1. Read upstream's latest release (``gh api repos/skiptools/<repo>/releases/latest``),
    falling back to the highest semver tag.
@@ -66,7 +66,9 @@ class ForkConfig:
     name: str
     upstream: str  # owner/repo
     fork: str  # owner/repo
-    tag_sep: str  # "-vds." or "+vds."
+    # Release tags are SemVer prereleases "<upstream>-vds.N". Never "+vds.N": SwiftPM ignores build
+    # metadata, so a second "+vds.N" on one version silently re-points existing pins.
+    tag_sep: str
     stamp_rules: Tuple[StampRule, ...] = ()
     # Changed lines in a manifest that pin one of our forks; flagged for review, still applied.
     pin_pattern: str = r"vindhyadatascience/|[-+]vds\.\d"
@@ -86,19 +88,33 @@ SKIP_STAMP = StampRule(
     path="Package.swift",
     pattern=r"binaryTarget\(\s*name:\s*\"skip\"\s*,\s*url:",
     how=(
-        "once the skipstone `{new}-vds.N` release is published, point the macOS "
-        "`binaryTarget` at `https://github.com/vindhyadatascience/skipstone/releases/download/"
-        "{new}-vds.N/skip-macos.zip` and set `checksum` to that asset's SHA-256 (the "
-        "`skip-macos.zip.sha256` file on the release), then commit on `vds/{new}`."
+        "once the skipstone `{new}-vds.N` release is published, point the macOS `binaryTarget` at "
+        "`https://github.com/vindhyadatascience/skipstone/releases/download/{new}-vds.N/skip-macos.zip` "
+        "and the Linux one at `.../{new}-vds.N/skip-linux.zip`, and set each `checksum` to that "
+        "asset's SHA-256 (its `.sha256` file on the release), then commit on `vds/{new}`."
+    ),
+)
+
+# The skip wrapper also pins the skipstone source it was built from (a revision dependency used by
+# platforms that build the compiler from source). Like the binaryTarget, its value is wrong for a
+# new version, so a commit that only moves these pins is regenerated after the build, never applied.
+SKIP_SOURCE_PIN = StampRule(
+    path="Package.swift",
+    pattern=r"\.package\(\s*url:\s*\"https://github\.com/(?:vindhyadatascience|skiptools)/skipstone(?:\.git)?\"\s*,\s*(?:revision|exact|from):",
+    how=(
+        "point the skipstone source dependency at the commit the published `{new}{sep}N` release "
+        "was built from (`.package(url: \"https://github.com/vindhyadatascience/skipstone.git\", "
+        "revision: \"<that commit>\")`), then commit on `vds/{new}`."
     ),
 )
 
 FORKS: Dict[str, ForkConfig] = {
     "skipstone": ForkConfig("skipstone", "skiptools/skipstone", "vindhyadatascience/skipstone", "-vds.", (SKIPSTONE_STAMP,)),
-    "skip": ForkConfig("skip", "skiptools/skip", "vindhyadatascience/skip", "+vds.", (SKIP_STAMP,)),
+    "skip": ForkConfig("skip", "skiptools/skip", "vindhyadatascience/skip", "-vds.", (SKIP_STAMP, SKIP_SOURCE_PIN)),
     "skip-ui": ForkConfig("skip-ui", "skiptools/skip-ui", "vindhyadatascience/skip-ui", "-vds."),
-    "skip-foundation": ForkConfig("skip-foundation", "skiptools/skip-foundation", "vindhyadatascience/skip-foundation", "+vds."),
-    "skip-lib": ForkConfig("skip-lib", "skiptools/skip-lib", "vindhyadatascience/skip-lib", "+vds."),
+    "skip-foundation": ForkConfig("skip-foundation", "skiptools/skip-foundation", "vindhyadatascience/skip-foundation", "-vds."),
+    "skip-lib": ForkConfig("skip-lib", "skiptools/skip-lib", "vindhyadatascience/skip-lib", "-vds."),
+    "skip-unit": ForkConfig("skip-unit", "skiptools/skip-unit", "vindhyadatascience/skip-unit", "-vds."),
 }
 
 
@@ -235,6 +251,9 @@ class Patch:
     stamp_only: bool = False
     stamp_how: List[str] = field(default_factory=list)
     has_pins: bool = False
+    # Files whose every changed line is a stamp/pin, in a patch that also changes other files:
+    # the rest of the patch is applied and these files are left to regeneration.
+    stamp_files: List[str] = field(default_factory=list)
     status: str = "pending"  # applied | already-upstream | conflict | regenerate-after-build | missing
     files: List[str] = field(default_factory=list)  # conflicting files
     note: str = ""
@@ -327,6 +346,16 @@ def classify_patch(g: Git, cfg: ForkConfig, sha: str, new: str) -> Patch:
     if stamp_only:
         p.stamp_how = [r.how.format(new=new, sep=cfg.tag_sep) for r in rules_hit]
         p.has_pins = False
+    elif rules_hit:
+        by_file: Dict[str, bool] = {}
+        for path, line in lines:
+            hit = any(r.path == path and re.search(r.pattern, line) for r in cfg.stamp_rules)
+            by_file[path] = by_file.get(path, True) and hit
+        p.stamp_files = sorted(f for f, all_stamp in by_file.items() if all_stamp)
+        if p.stamp_files:
+            p.stamp_how = [r.how.format(new=new, sep=cfg.tag_sep) for r in rules_hit]
+            p.has_pins = any(path.split("/")[-1] in cfg.pin_files and re.search(cfg.pin_pattern, line)
+                             for path, line in lines if path not in p.stamp_files)
     return p
 
 
@@ -422,9 +451,46 @@ def cherry_picked_from(g: Git, rng: str) -> Dict[str, str]:
     return out
 
 
+def _pick_without_stamp_files(g: Git, p: Patch, head_before: str) -> None:
+    """Apply ``p`` except its stamp-only files, which keep HEAD's content (they are regenerated
+    for the new version after the build, like a stamp-only patch)."""
+    r = g.run("cherry-pick", "-n", "--allow-empty-message", p.sha, check=False)
+    for f in p.stamp_files:
+        if g.run("cat-file", "-e", f"HEAD:{f}", check=False).returncode == 0:
+            g.run("checkout", "HEAD", "--", f, check=False)
+        else:
+            g.run("rm", "-q", "-f", "--cached", "--ignore-unmatch", "--", f, check=False)
+            g.run("clean", "-q", "-f", "--", f, check=False)
+    unmerged = g.lines("diff", "--name-only", "--diff-filter=U")
+    if unmerged or (r.returncode != 0 and not g.lines("diff", "--cached", "--name-only")):
+        p.status = "conflict"
+        p.files = unmerged or ["(see git output)"]
+        if not unmerged:
+            p.note = (r.stderr.strip().splitlines() or [""])[-1][:200]
+        g.run("cherry-pick", "--abort", check=False)
+        g.run("reset", "--hard", "-q", head_before, check=False)
+        return
+    if not g.lines("diff", "--cached", "--name-only"):
+        g.run("cherry-pick", "--quit", check=False)
+        g.run("reset", "--hard", "-q", head_before, check=False)
+        p.status = "already-upstream"
+        return
+    message = g.out("log", "-1", "--format=%B", p.sha).rstrip("\n")
+    message += f"\n\n(cherry picked from commit {p.sha}; stamp-only files left for regeneration: {', '.join(p.stamp_files)})"
+    author = g.out("log", "-1", "--format=%an <%ae>", p.sha)
+    date = g.out("log", "-1", "--format=%aI", p.sha)
+    g.run("commit", "-q", "--allow-empty-message", f"--author={author}", f"--date={date}", "-m", message)
+    g.run("cherry-pick", "--quit", check=False)
+    p.status = "applied"
+    p.note = "pins in " + ", ".join(p.stamp_files) + " regenerated after build"
+
+
 def try_pick(g: Git, p: Patch) -> None:
     """Cherry-pick ``p`` onto HEAD. Sets p.status to applied / already-upstream / conflict."""
     head_before = g.out("rev-parse", "HEAD")
+    if p.stamp_files:
+        _pick_without_stamp_files(g, p, head_before)
+        return
     r = g.run("cherry-pick", "-x", "--allow-empty-message", p.sha, check=False)
     if r.returncode == 0:
         p.status = "applied" if g.out("rev-parse", "HEAD") != head_before else "already-upstream"
@@ -484,7 +550,10 @@ def manual_steps(cfg: ForkConfig, res: Result) -> str:
         steps = [
             f"1. Resolve anything listed above on `{res.rebase_branch}`, then merge this PR into `{res.new_branch}` (merge commit or rebase; do not squash, so each patch stays one commit).",
         ]
-    regen = [h for p in res.patches if p.stamp_only for h in p.stamp_how]
+    regen: List[str] = []
+    for p in res.patches:
+        if p.stamp_only or p.stamp_files:
+            regen += [h for h in p.stamp_how if h not in regen]
     if regen:
         steps.append("2. Regenerate version stamps on `{}`:\n{}".format(
             res.new_branch, "\n".join(f"   - {h}" for h in regen)))
@@ -498,10 +567,7 @@ def manual_steps(cfg: ForkConfig, res: Result) -> str:
         steps.append(f"4. Tag `{tag}` at the merged `{res.new_branch}` head (it must be the commit the draft release targets) and publish the release.")
     else:
         steps.append(f"3. Tag `{tag}` at the merged `{res.new_branch}` head and push the tag; create the GitHub release if this fork publishes one.")
-    if cfg.tag_sep == "+vds.":
-        steps.append(f"{len(steps) + 1}. Verify the published `{tag}` tag peels to the reviewed source commit and record that full SHA. Pin that immutable `.revision(\"<verified-commit>\")` in GeneFox and consuming forks, then run the full gate. SwiftPM treats +metadata variants as the same version; do not rely on an exact version to select one, and never clear fingerprints to bypass a mismatch.")
-    else:
-        steps.append(f"{len(steps) + 1}. Verify `{tag}` peels to the reviewed source commit. Bump GeneFox's exact-version pin to `{tag}` (skip-ui uses `.exact(\"{tag}\")`); update any consuming fork/tap and run the full gate.")
+    steps.append(f"{len(steps) + 1}. Verify the published `{tag}` tag peels to the reviewed source commit and record that full SHA. Pin that immutable `.revision(\"<verified-commit>\")` in GeneFox (root and FoxKit manifests, lockfiles and SkipForkPinContractTests together) and in any consuming fork, then run the full gate. Never clear fingerprints to bypass a revision mismatch.")
     return "\n".join(steps)
 
 
@@ -833,7 +899,7 @@ def write_step_summary(text: str) -> None:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--fork", action="append", choices=sorted(FORKS) + ["all"],
-                    help="fork to sync (repeatable; default: all five)")
+                    help="fork to sync (repeatable; default: all six)")
     ap.add_argument("--dry-run", action="store_true", help="print the plan; push nothing, write nothing to GitHub")
     ap.add_argument("--rehearse", action="store_true",
                     help="with --dry-run: ignore an existing vds/<latest> branch and rebase PR and rehearse the "
