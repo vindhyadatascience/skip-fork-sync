@@ -8,10 +8,11 @@ bumping pins stay manual.
 | Fork | Upstream | Our release tags |
 | --- | --- | --- |
 | [vindhyadatascience/skipstone](https://github.com/vindhyadatascience/skipstone) | skiptools/skipstone | `<ver>-vds.N` |
-| [vindhyadatascience/skip](https://github.com/vindhyadatascience/skip) | skiptools/skip | `<ver>+vds.N` |
+| [vindhyadatascience/skip](https://github.com/vindhyadatascience/skip) | skiptools/skip | `<ver>-vds.N` |
 | [vindhyadatascience/skip-ui](https://github.com/vindhyadatascience/skip-ui) | skiptools/skip-ui | `<ver>-vds.N` |
-| [vindhyadatascience/skip-foundation](https://github.com/vindhyadatascience/skip-foundation) | skiptools/skip-foundation | `<ver>+vds.N` |
-| [vindhyadatascience/skip-lib](https://github.com/vindhyadatascience/skip-lib) | skiptools/skip-lib | `<ver>+vds.N` |
+| [vindhyadatascience/skip-foundation](https://github.com/vindhyadatascience/skip-foundation) | skiptools/skip-foundation | `<ver>-vds.N` |
+| [vindhyadatascience/skip-lib](https://github.com/vindhyadatascience/skip-lib) | skiptools/skip-lib | `<ver>-vds.N` |
+| [vindhyadatascience/skip-unit](https://github.com/vindhyadatascience/skip-unit) | skiptools/skip-unit | `<ver>-vds.N` |
 
 Each fork holds only `main` (a pure mirror of upstream) and our `vds/<upstream version>` branches.
 
@@ -56,10 +57,15 @@ Patches that only change version stamps are not cherry-picked, because their val
 the new version. They are listed as **regenerate after build**:
 
 - skipstone: `skipVersion` in `Sources/SkipSyntax/Version.swift`;
-- skip: the macOS `binaryTarget` url/checksum in `Package.swift`.
+- skip: the macOS and Linux `binaryTarget` url/checksum lines and the skipstone source dependency
+  (`.package(url: ".../skipstone.git", revision: ...)`) in `Package.swift`.
 
-Patches that change a VDS version pin alongside code (for example skip-foundation's `Package.swift`
-pointing at our skip-lib release) are applied and flagged for review.
+A patch whose stamp lines fill whole files but which also changes other files (skip's vds.3 pin
+commit also added the fork README) is applied without those files; they keep the new upstream
+content and are listed for regeneration.
+
+Patches that change a VDS version pin alongside code in the same file (for example skip-foundation's
+`Package.swift` pointing at our skip-lib release) are applied and flagged for review.
 
 For skipstone, when a new PR is created, `sync.yml` dispatches `.github/workflows/skipstone-build.yml`.
 On `macos-latest` it builds `skip-macos.zip` from `rebase/<new>` as `VDS-BUILD.md` in the skipstone fork
@@ -93,12 +99,12 @@ Use either:
   Personal access tokens > Fine-grained tokens > Generate new token:
   - Resource owner: `vindhyadatascience`
   - Repository access: *Only select repositories*: `skipstone`, `skip`, `skip-ui`, `skip-foundation`,
-    `skip-lib` (not this repo, not anything else)
+    `skip-lib`, `skip-unit` (not this repo, not anything else)
   - Repository permissions: **Contents: Read and write**, **Pull requests: Read and write**,
     **Actions: Read**. (Metadata: Read is added automatically.) Nothing else.
   - Pick an expiry and set a reminder to rotate it. If the organization requires approval for
     fine-grained tokens, an org owner must approve it.
-- **GitHub App** installed on those five repositories only, with the same permissions, minting an
+- **GitHub App** installed on those six repositories only, with the same permissions, minting an
   installation token. (That needs an extra token-minting step in the workflows; the PAT is enough.)
 
 Add the secret: this repo > Settings > Secrets and variables > Actions > New repository secret, name
@@ -121,7 +127,7 @@ written to GitHub.
 Locally (needs Python 3.9+, git, and `gh auth login`; read-only):
 
 ```bash
-python3 scripts/sync_fork.py --dry-run                        # all five forks
+python3 scripts/sync_fork.py --dry-run                        # all six forks
 python3 scripts/sync_fork.py --dry-run --fork skip-ui
 python3 scripts/sync_fork.py --dry-run --rehearse             # pretend vds/<latest> does not exist yet:
                                                               # replays the previous upgrade from the
@@ -149,7 +155,7 @@ python3 -m unittest discover -s tests -v
    - skip: after the skipstone `<new>-vds.N` release is published, point the macOS `binaryTarget` at
      `https://github.com/vindhyadatascience/skipstone/releases/download/<new>-vds.N/skip-macos.zip` and
      set `checksum` to the SHA-256 in that release's `skip-macos.zip.sha256`.
-   - any fork pinning another fork (skip-foundation -> skip-lib) : bump the pin if that fork got a
+   - any fork pinning another fork (skip-foundation -> skip-lib -> skip-unit) : bump the pin if that fork got a
      new release.
 4. Tag and release:
    - skipstone: check the draft release's binary and check summary. If the merged `vds/<new>` head
@@ -157,12 +163,11 @@ python3 -m unittest discover -s tests -v
      skipstone-build with `ref: vds/<new>` so the attached binary is built from the tagged source
      (AGPL: the tag is the corresponding source). Then publish the draft, which creates the tag
      `<new>-vds.1`.
-   - others: `git tag <new>-vds.1` (skip-ui) or `git tag '<new>+vds.1'` (skip, skip-foundation,
-     skip-lib) at the merged `vds/<new>` head and push it.
-5. Verify each published tag peels to the reviewed source commit and record its full SHA.
-   For metadata-tagged forks (`skip`, `skip-lib`, `skip-foundation`, tags `+vds.N`), use that
-   immutable `.revision("<verified-commit>")` in GeneFox and consuming forks: SwiftPM compares
-   metadata variants as the same version, so an exact version does not select the variant.
-   Never clear fingerprints to bypass a revision mismatch. `skip-ui` keeps its exact
-   prerelease-version pin (`-vds.N`). Update the Homebrew tap for skipstone and run the full gate.
+   - others: `git tag <new>-vds.1` at the merged `vds/<new>` head and push it.
+5. Verify each published tag peels to the reviewed source commit and record its full SHA. GeneFox
+   pins every fork by that immutable `.revision("<verified-commit>")` (root and FoxKit manifests,
+   lockfiles and SkipForkPinContractTests together). Tags are SemVer prereleases `<ver>-vds.N`;
+   never publish `+vds.N`: SwiftPM ignores build metadata, so a second `+vds.N` on one version is the
+   same version to it and silently re-points existing pins. (Older `+vds.N` tags are kept.) Never
+   clear fingerprints to bypass a revision mismatch. Update the Homebrew tap for skipstone and run the full gate.
 6. Once GeneFox is on the new version, delete the superseded `vds/<old>` branch (its tags stay).

@@ -11,7 +11,7 @@ on:
       fork:
         description: "Fork to sync"
         type: choice
-        options: [all, skipstone, skip, skip-ui, skip-foundation, skip-lib]
+        options: [all, skipstone, skip, skip-ui, skip-foundation, skip-lib, skip-unit]
         default: all
       dry_run:
         description: "Dry run: print the plan, push nothing"
@@ -36,8 +36,8 @@ jobs:
           FORK: ${{ inputs.fork }}
         run: |
           case "${FORK:-all}" in
-            all) echo 'forks=["skipstone","skip","skip-ui","skip-foundation","skip-lib"]' >> "$GITHUB_OUTPUT" ;;
-            skipstone|skip|skip-ui|skip-foundation|skip-lib) echo "forks=[\"$FORK\"]" >> "$GITHUB_OUTPUT" ;;
+            all) echo 'forks=["skipstone","skip","skip-ui","skip-foundation","skip-lib","skip-unit"]' >> "$GITHUB_OUTPUT" ;;
+            skipstone|skip|skip-ui|skip-foundation|skip-lib|skip-unit) echo "forks=[\"$FORK\"]" >> "$GITHUB_OUTPUT" ;;
             *) echo "::error::unknown fork '$FORK'"; exit 1 ;;
           esac
 
@@ -63,7 +63,7 @@ jobs:
             if [ "$DRY_RUN" = "true" ]; then
               echo "::warning::FORK_SYNC_TOKEN is not set; the dry run uses the read-only workflow token."
             else
-              echo "::error title=FORK_SYNC_TOKEN missing::Add a repository secret named FORK_SYNC_TOKEN (Settings > Secrets and variables > Actions > New repository secret): a fine-grained PAT or GitHub App token with Contents: read and write, Pull requests: read and write, and Actions: read on vindhyadatascience/skipstone, skip, skip-ui, skip-foundation and skip-lib. See README.md."
+              echo "::error title=FORK_SYNC_TOKEN missing::Add a repository secret named FORK_SYNC_TOKEN (Settings > Secrets and variables > Actions > New repository secret): a fine-grained PAT or GitHub App token with Contents: read and write, Pull requests: read and write, and Actions: read on vindhyadatascience/skipstone, skip, skip-ui, skip-foundation, skip-lib and skip-unit. See README.md."
               exit 1
             fi
           fi
