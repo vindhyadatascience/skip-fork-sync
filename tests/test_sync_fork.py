@@ -233,6 +233,31 @@ class TestPatchDetection(Base):
         self.assertEqual(p.stamp_how, [])
 
 
+    def test_skipstone_stamp_and_notes_commit_applies_notes_and_regenerates_version(self):
+        # Real shape (skipstone ec9bad48): the skipVersion stamp plus a VDS-BUILD.md notes section.
+        fx = self.make()
+        git(fx.work, "checkout", "-q", "vds/1.0")
+        sha = commit(fx.work, "Stamp 1.9.19-vds.5 and record its changes (RNABrowser-fiea.28)", {
+            VERSION_SWIFT: 'public let skipVersion = "1.0.0-vds.5"\n',
+            "VDS-BUILD.md": "how we build\n\n## 1.0.0-vds.5 (RNABrowser-fiea.28)\n\n- Diagnostics only.\n"})
+        g = sf.Git(fx.work, ENV)
+        p = sf.classify_patch(g, sf.FORKS["skipstone"], sha, "1.1.0")
+        self.assertFalse(p.stamp_only)
+        self.assertFalse(p.has_pins)
+        self.assertEqual(p.stamp_paths, [VERSION_SWIFT])
+        # Apply on the upstream 1.1.0 base, as the rebase does.
+        git(fx.work, "checkout", "-q", "-B", "rebase/1.1.0", "1.1.0")
+        commit(fx.work, "VDS: build doc", {"VDS-BUILD.md": "how we build\n"})  # earlier patch, already applied
+        head = git(fx.work, "rev-parse", "HEAD")
+        sf.try_pick(g, p)
+        self.assertEqual(p.status, "applied")
+        self.assertNotEqual(git(fx.work, "rev-parse", "HEAD"), head)
+        self.assertEqual(git(fx.work, "show", f"HEAD:{VERSION_SWIFT}"), 'public let skipVersion = "1.1.0"')
+        self.assertIn("## 1.0.0-vds.5 (RNABrowser-fiea.28)", git(fx.work, "show", "HEAD:VDS-BUILD.md"))
+        self.assertIn(sha, sf.cherry_picked_from(g, "1.1.0..HEAD"))
+        self.assertEqual(git(fx.work, "status", "--porcelain"), "")
+
+
 class TestCreate(Base):
     def test_dry_run_pushes_nothing(self):
         fx = self.make()

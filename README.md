@@ -61,8 +61,8 @@ the new version. They are listed as **regenerate after build**:
   (or upstream's `exact:`), in `Package.swift`.
 
 A commit that changes stamp files and other files (skip's pin commits can also carry a README note) is
-applied without its stamp files: the other changes are kept, and the stamps are regenerated. Only skip
-opts in (`partial_stamps`); the other forks still cherry-pick whole commits.
+applied without its stamp files: the other changes are kept, and the stamps are regenerated. skipstone
+and skip opt in (`partial_stamps`); skip-ui, skip-foundation and skip-lib still cherry-pick whole commits.
 
 Patches that change a VDS version pin alongside code (for example skip-foundation's `Package.swift`
 pointing at our skip-lib release) are applied and flagged for review.

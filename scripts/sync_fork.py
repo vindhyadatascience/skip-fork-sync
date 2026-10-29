@@ -113,7 +113,8 @@ SKIP_SKIPSTONE_STAMP = StampRule(
 )
 
 FORKS: Dict[str, ForkConfig] = {
-    "skipstone": ForkConfig("skipstone", "skiptools/skipstone", "vindhyadatascience/skipstone", "-vds.", (SKIPSTONE_STAMP,)),
+    "skipstone": ForkConfig("skipstone", "skiptools/skipstone", "vindhyadatascience/skipstone", "-vds.",
+                            (SKIPSTONE_STAMP,), partial_stamps=True),
     "skip": ForkConfig("skip", "skiptools/skip", "vindhyadatascience/skip", "+vds.",
                        (SKIP_STAMP, SKIP_SKIPSTONE_STAMP), partial_stamps=True),
     "skip-ui": ForkConfig("skip-ui", "skiptools/skip-ui", "vindhyadatascience/skip-ui", "-vds."),
