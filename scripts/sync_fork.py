@@ -14,9 +14,13 @@ For each fork (skipstone, skip, skip-ui, skip-foundation, skip-lib):
 4. If the PR / branches already exist, the status comment on the PR is updated in place
    (never duplicated) and the PR body refreshed.
 
-Patches that only change version stamps (skipstone's ``skipVersion``, skip's macOS
-``binaryTarget`` url/checksum) are not cherry-picked: their values are wrong for a new
-version, so the PR lists them under "regenerate after build".
+Patches that only change version stamps (skipstone's ``skipVersion``; skip's ``binaryTarget``
+url/checksum and its skipstone dependency in ``Package.swift``) are not cherry-picked: their values
+are wrong for a new version, so the PR lists them under "regenerate after build". A commit that
+also changes other files is applied without its stamp files.
+
+A source whose own upgrade (``rebase/<source>``) is an open PR is "awaiting-review": reported,
+nothing written, exit 0. Closed-unmerged or unaccounted-for upgrades are errors.
 
 ``--dry-run`` does all the local git work in a scratch clone (so conflicts are predicted
 exactly) and prints the plan; it pushes nothing and makes no write calls to GitHub.
@@ -71,6 +75,9 @@ class ForkConfig:
     # Changed lines in a manifest that pin one of our forks; flagged for review, still applied.
     pin_pattern: str = r"vindhyadatascience/|[-+]vds\.\d"
     pin_files: Tuple[str, ...] = ("Package.swift",)
+    # A commit that changes stamp files and other files is applied minus its stamp files (they are
+    # regenerated after the build). Off by default: the whole commit is cherry-picked, as before.
+    partial_stamps: bool = False
 
 
 SKIPSTONE_STAMP = StampRule(
@@ -86,16 +93,30 @@ SKIP_STAMP = StampRule(
     path="Package.swift",
     pattern=r"binaryTarget\(\s*name:\s*\"skip\"\s*,\s*url:",
     how=(
-        "once the skipstone `{new}-vds.N` release is published, point the macOS "
-        "`binaryTarget` at `https://github.com/vindhyadatascience/skipstone/releases/download/"
-        "{new}-vds.N/skip-macos.zip` and set `checksum` to that asset's SHA-256 (the "
-        "`skip-macos.zip.sha256` file on the release), then commit on `vds/{new}`."
+        "once the skipstone `{new}-vds.N` release is published, point the macOS and Linux "
+        "`binaryTarget`s at `https://github.com/vindhyadatascience/skipstone/releases/download/"
+        "{new}-vds.N/skip-macos.zip` and `.../{new}-vds.N/skip-linux.zip`, set each `checksum` to "
+        "that asset's SHA-256 (its `.sha256` file on the release), then commit on `vds/{new}`."
+    ),
+)
+# The skipstone dependency of skip's non-Apple, non-Linux branch: upstream's `exact:` form or our
+# `revision:` form. It is a version pin, so it is regenerated with the binary targets.
+SKIP_SKIPSTONE_STAMP = StampRule(
+    path="Package.swift",
+    pattern=(r'^\s*package\.dependencies\s*\+=\s*\[\.package\(url:\s*"https://github\.com/'
+             r'(?:vindhyadatascience|skiptools)/skipstone\.git"\s*,\s*(?:exact|revision):\s*"[^"]*"\)\]\s*$'),
+    how=(
+        "once the skipstone `{new}-vds.N` tag exists, point the `skipstone` dependency in "
+        "`Package.swift` at the commit that tag peels to: `revision:` on "
+        "`https://github.com/vindhyadatascience/skipstone.git` (not `exact:`), then commit on `vds/{new}`."
     ),
 )
 
 FORKS: Dict[str, ForkConfig] = {
-    "skipstone": ForkConfig("skipstone", "skiptools/skipstone", "vindhyadatascience/skipstone", "-vds.", (SKIPSTONE_STAMP,)),
-    "skip": ForkConfig("skip", "skiptools/skip", "vindhyadatascience/skip", "+vds.", (SKIP_STAMP,)),
+    "skipstone": ForkConfig("skipstone", "skiptools/skipstone", "vindhyadatascience/skipstone", "-vds.",
+                            (SKIPSTONE_STAMP,), partial_stamps=True),
+    "skip": ForkConfig("skip", "skiptools/skip", "vindhyadatascience/skip", "+vds.",
+                       (SKIP_STAMP, SKIP_SKIPSTONE_STAMP), partial_stamps=True),
     "skip-ui": ForkConfig("skip-ui", "skiptools/skip-ui", "vindhyadatascience/skip-ui", "-vds."),
     "skip-foundation": ForkConfig("skip-foundation", "skiptools/skip-foundation", "vindhyadatascience/skip-foundation", "+vds."),
     "skip-lib": ForkConfig("skip-lib", "skiptools/skip-lib", "vindhyadatascience/skip-lib", "+vds."),
@@ -234,6 +255,7 @@ class Patch:
     subject: str
     stamp_only: bool = False
     stamp_how: List[str] = field(default_factory=list)
+    stamp_paths: List[str] = field(default_factory=list)  # files whose changes are all stamps: never applied
     has_pins: bool = False
     status: str = "pending"  # applied | already-upstream | conflict | regenerate-after-build | missing
     files: List[str] = field(default_factory=list)  # conflicting files
@@ -244,7 +266,8 @@ class Patch:
 class Result:
     fork: str
     action: str = "error"  # up-to-date | created | refreshed | closed | would-create | would-refresh
-    # Also manual-only / would-manual-only (no file changes), blocked (unresolved), or error.
+    # Also manual-only / would-manual-only (no file changes), blocked (unresolved), error, or
+    # awaiting-review (the patch source's own upgrade is an open PR; nothing is written).
     upstream_tag: str = ""
     upstream_source: str = ""  # "latest release" | "highest tag"
     old_branch: str = ""
@@ -313,20 +336,34 @@ def classify_patch(g: Git, cfg: ForkConfig, sha: str, new: str) -> Patch:
     subject = g.out("log", "-1", "--format=%s", sha)
     p = Patch(sha=sha, subject=subject)
     lines = changed_lines(g, sha)
-    rules_hit: List[StampRule] = []
-    stamp_only = bool(lines) and bool(cfg.stamp_rules)
+    # A file is a stamp file when every changed line in it matches a stamp rule for that path.
+    file_is_stamp: Dict[str, bool] = {}
+    file_rules: Dict[str, List[StampRule]] = {}
+    pin_files_hit: List[str] = []
     for path, line in lines:
         hit = next((r for r in cfg.stamp_rules if r.path == path and re.search(r.pattern, line)), None)
-        if hit is None:
-            stamp_only = False
-        elif hit not in rules_hit:
-            rules_hit.append(hit)
+        file_is_stamp[path] = file_is_stamp.get(path, True) and hit is not None
+        if hit is not None:
+            file_rules.setdefault(path, [])
+            if hit not in file_rules[path]:
+                file_rules[path].append(hit)
         if path.split("/")[-1] in cfg.pin_files and re.search(cfg.pin_pattern, line):
-            p.has_pins = True
-    p.stamp_only = stamp_only
-    if stamp_only:
-        p.stamp_how = [r.how.format(new=new, sep=cfg.tag_sep) for r in rules_hit]
-        p.has_pins = False
+            pin_files_hit.append(path)
+    p.stamp_only = bool(lines) and bool(cfg.stamp_rules) and all(file_is_stamp.values())
+    stamp_files = sorted(f for f, ok in file_is_stamp.items() if ok)
+    # The files this patch would apply: none for a stamp-only commit, all but the stamp files
+    # with partial_stamps, otherwise all of them (the whole commit is cherry-picked).
+    if p.stamp_only:
+        applied: List[str] = []
+    elif cfg.partial_stamps:
+        applied = [f for f in file_is_stamp if f not in stamp_files]
+    else:
+        applied = list(file_is_stamp)
+    p.has_pins = any(f in applied for f in pin_files_hit)
+    if p.stamp_only or cfg.partial_stamps:
+        p.stamp_paths = stamp_files
+        rules = [r for f in stamp_files for r in file_rules.get(f, [])]
+        p.stamp_how = [r.how.format(new=new, sep=cfg.tag_sep) for r in dict.fromkeys(rules)]
     return p
 
 
@@ -363,6 +400,14 @@ def base_tag_of(g: Git, branch_ref: str, branch_version: Tuple[int, int, int],
     return max(ancestors, key=lambda t: (tags[t], t))
 
 
+class AwaitingReview(SyncError):
+    """Not a failure: the patch source's own upgrade is an open PR waiting for review."""
+
+    def __init__(self, message: str, pr: dict):
+        super().__init__(message)
+        self.pr = pr
+
+
 def require_reviewed_patch_source(g: Git, gh: GitHub, cfg: ForkConfig,
                                   branch: str, base_tag: str) -> None:
     """A bot-created upstream baseline is not the accepted VDS patch queue.
@@ -384,8 +429,12 @@ def require_reviewed_patch_source(g: Git, gh: GitHub, cfg: ForkConfig,
         if not g.is_ancestor(oid, f"refs/remotes/origin/{branch}"):
             raise SyncError(f"patch source {branch} needs review: accepted merge commit is not an ancestor of the selected source")
     merged = bool(accepted)
-    if any(p.get("state") == "OPEN" for p in prs):
-        raise SyncError(f"patch source {branch} still needs review: {rebase} has an open PR; finish that upgrade first")
+    open_pr = next((p for p in prs if p.get("state") == "OPEN"), None)
+    if open_pr is not None:
+        draft = " (draft)" if open_pr.get("isDraft") else ""
+        raise AwaitingReview(
+            f"patch source {branch} awaits review: {rebase} is open as PR #{open_pr['number']}{draft} "
+            f"{open_pr.get('url', '')}; the next upgrade waits until that PR is merged", open_pr)
     if any(p.get("state") == "CLOSED" for p in prs) and not merged:
         raise SyncError(f"patch source {branch} still needs review: {rebase} was closed without merging")
     if g.ref_exists(f"refs/remotes/origin/{rebase}") and not merged:
@@ -422,8 +471,40 @@ def cherry_picked_from(g: Git, rng: str) -> Dict[str, str]:
     return out
 
 
+def apply_without_stamps(g: Git, p: Patch) -> None:
+    """Apply a commit that mixes version stamps with other changes: all of it except the stamp files,
+    which are regenerated after the build. ``git apply`` is all-or-nothing, so a conflict leaves the
+    tree untouched. The commit keeps cherry-pick's provenance trailer, which the bot reads."""
+    files = [f for f in g.lines("show", "--format=", "--name-only", p.sha) if f not in p.stamp_paths]
+    diff = g.run("diff", f"{p.sha}^", p.sha, "--", *files).stdout if files else ""
+    if not diff.strip():
+        p.status = "already-upstream"
+        return
+    check = g.run("apply", "--check", check=False, input=diff)
+    if check.returncode != 0:
+        if g.run("apply", "--reverse", "--check", check=False, input=diff).returncode == 0:
+            p.status = "already-upstream"  # the branch already has these changes
+            return
+        failing = re.findall(r"^error: (?:patch failed: )?(.+?)(?::\d+|: patch does not apply)$",
+                             check.stderr, re.M)
+        p.status = "conflict"
+        p.files = sorted({f for f in failing if f in files}) or files
+        return
+    g.run("apply", "--index", input=diff)
+    if g.run("diff", "--cached", "--quiet", check=False).returncode == 0:
+        p.status = "already-upstream"
+        return
+    author = g.out("log", "-1", "--format=%an <%ae>", p.sha)
+    message = g.out("log", "-1", "--format=%B", p.sha) + f"\n\n(cherry picked from commit {p.sha})\n"
+    g.run("commit", "-q", f"--author={author}", "-F", "-", input=message)
+    p.status = "applied"
+
+
 def try_pick(g: Git, p: Patch) -> None:
     """Cherry-pick ``p`` onto HEAD. Sets p.status to applied / already-upstream / conflict."""
+    if p.stamp_paths and not p.stamp_only:
+        apply_without_stamps(g, p)
+        return
     head_before = g.out("rev-parse", "HEAD")
     r = g.run("cherry-pick", "-x", "--allow-empty-message", p.sha, check=False)
     if r.returncode == 0:
@@ -467,6 +548,8 @@ def patch_table(res: Result) -> str:
             notes.append(p.note.replace("|", "\\|"))
         if p.stamp_only:
             notes.append("version stamp only")
+        elif p.stamp_paths and p.status == "applied":
+            notes.append("applied without its version-stamp file(s) " + ", ".join(f"`{f}`" for f in p.stamp_paths))
         if p.has_pins:
             notes.append("touches a VDS version pin in Package.swift: check it names the right fork release")
         subject = p.subject.replace("|", "\\|")
@@ -484,7 +567,7 @@ def manual_steps(cfg: ForkConfig, res: Result) -> str:
         steps = [
             f"1. Resolve anything listed above on `{res.rebase_branch}`, then merge this PR into `{res.new_branch}` (merge commit or rebase; do not squash, so each patch stays one commit).",
         ]
-    regen = [h for p in res.patches if p.stamp_only for h in p.stamp_how]
+    regen = list(dict.fromkeys(h for p in res.patches for h in p.stamp_how))  # one line per rule
     if regen:
         steps.append("2. Regenerate version stamps on `{}`:\n{}".format(
             res.new_branch, "\n".join(f"   - {h}" for h in regen)))
@@ -565,9 +648,12 @@ def plan_text(cfg: ForkConfig, res: Result) -> str:
     if res.upstream_tag:
         lines.append(f"   upstream {res.upstream_source}: {res.upstream_tag}")
     if res.old_branch and res.base_tag:
-        lines.append(f"   patches from: {res.old_branch} (base {res.base_tag}), {len(res.patches)} patch(es)")
+        count = "" if res.action == "awaiting-review" else f", {len(res.patches)} patch(es)"
+        lines.append(f"   patches from: {res.old_branch} (base {res.base_tag}){count}")
     elif res.old_branch:
         lines.append(f"   our newest branch: {res.old_branch}")
+    if res.action == "awaiting-review":
+        lines.append("   no branches, PRs or comments written for this fork; it is not an error")
     if res.action in ("would-create", "created", "refreshed", "would-refresh",
                       "manual-only", "would-manual-only", "blocked"):
         lines.append(f"   upstream changes since base: {res.upstream_count} commits ({res.compare_url})")
@@ -685,7 +771,13 @@ def _sync(cfg: ForkConfig, gh: GitHub, opts: Options, g: Git, res: Result) -> No
     res.old_branch = max(older, key=lambda b: (older[b], b))
     old_ref = f"refs/remotes/origin/{res.old_branch}"
     res.base_tag = base_tag_of(g, old_ref, older[res.old_branch], tags)
-    require_reviewed_patch_source(g, gh, cfg, res.old_branch, res.base_tag)
+    try:
+        require_reviewed_patch_source(g, gh, cfg, res.old_branch, res.base_tag)
+    except AwaitingReview as e:
+        res.action = "awaiting-review"
+        res.message = str(e)
+        res.pr_number, res.pr_url = e.pr.get("number"), e.pr.get("url", "")
+        return
     base_ref = f"refs/upstream-tags/{res.base_tag}"
 
     res.skipped_merges = len(g.lines("rev-list", "--merges", f"{base_ref}..{old_ref}"))
@@ -773,7 +865,7 @@ def _refresh(cfg: ForkConfig, gh: GitHub, opts: Options, g: Git, res: Result, op
         # Trial-apply on a scratch branch to name the files that still conflict.
         g.run("checkout", "-q", "-B", "skip-fork-sync-trial", rebase_ref)
         for p in unresolved:
-            trial = Patch(sha=p.sha, subject=p.subject)
+            trial = Patch(sha=p.sha, subject=p.subject, stamp_only=p.stamp_only, stamp_paths=p.stamp_paths)
             try_pick(g, trial)
             if trial.status == "conflict":
                 p.files = trial.files

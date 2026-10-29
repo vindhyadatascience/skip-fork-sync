@@ -3,12 +3,15 @@
 Run: python3 -m unittest discover -s tests -v
 """
 
+import contextlib
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
 import sync_fork as sf  # noqa: E402
@@ -218,6 +221,43 @@ class TestPatchDetection(Base):
         self.assertIsNone(sf.parse_version("1.4.7+vds.1"))
 
 
+    def test_stamp_plus_doc_is_not_split_for_forks_without_partial_stamps(self):
+        # skipstone-style: a stamp file and a doc in one commit are cherry-picked whole, as before.
+        fx = self.make()
+        git(fx.work, "checkout", "-q", "vds/1.0")
+        sha = commit(fx.work, "stamp and doc", {VERSION_SWIFT: 'public let skipVersion = "1.0.0-vds.9"\n',
+                                                "VDS-BUILD.md": "doc\n"})
+        p = sf.classify_patch(sf.Git(fx.work, ENV), FORK_CFG, sha, "1.1.0")
+        self.assertFalse(p.stamp_only)
+        self.assertEqual(p.stamp_paths, [])
+        self.assertEqual(p.stamp_how, [])
+
+
+    def test_skipstone_stamp_and_notes_commit_applies_notes_and_regenerates_version(self):
+        # Real shape (skipstone ec9bad48): the skipVersion stamp plus a VDS-BUILD.md notes section.
+        fx = self.make()
+        git(fx.work, "checkout", "-q", "vds/1.0")
+        sha = commit(fx.work, "Stamp 1.9.19-vds.5 and record its changes (RNABrowser-fiea.28)", {
+            VERSION_SWIFT: 'public let skipVersion = "1.0.0-vds.5"\n',
+            "VDS-BUILD.md": "how we build\n\n## 1.0.0-vds.5 (RNABrowser-fiea.28)\n\n- Diagnostics only.\n"})
+        g = sf.Git(fx.work, ENV)
+        p = sf.classify_patch(g, sf.FORKS["skipstone"], sha, "1.1.0")
+        self.assertFalse(p.stamp_only)
+        self.assertFalse(p.has_pins)
+        self.assertEqual(p.stamp_paths, [VERSION_SWIFT])
+        # Apply on the upstream 1.1.0 base, as the rebase does.
+        git(fx.work, "checkout", "-q", "-B", "rebase/1.1.0", "1.1.0")
+        commit(fx.work, "VDS: build doc", {"VDS-BUILD.md": "how we build\n"})  # earlier patch, already applied
+        head = git(fx.work, "rev-parse", "HEAD")
+        sf.try_pick(g, p)
+        self.assertEqual(p.status, "applied")
+        self.assertNotEqual(git(fx.work, "rev-parse", "HEAD"), head)
+        self.assertEqual(git(fx.work, "show", f"HEAD:{VERSION_SWIFT}"), 'public let skipVersion = "1.1.0"')
+        self.assertIn("## 1.0.0-vds.5 (RNABrowser-fiea.28)", git(fx.work, "show", "HEAD:VDS-BUILD.md"))
+        self.assertIn(sha, sf.cherry_picked_from(g, "1.1.0..HEAD"))
+        self.assertEqual(git(fx.work, "status", "--porcelain"), "")
+
+
 class TestCreate(Base):
     def test_dry_run_pushes_nothing(self):
         fx = self.make()
@@ -416,16 +456,30 @@ class TestPatchSourceTrust(Base):
         writes = {"sync", "create_pr", "create_comment", "edit_pr_body", "edit_comment"}
         self.assertFalse([c for c in fx.gh.calls[calls_from:] if c[0] in writes])
 
-    def test_pending_previous_rebase_cannot_replace_real_patch_source(self):
-        fx = self.make(extra_upstream_tags=("1.2.0",))
-        fx.run(latest="1.1.0")
-        self.assert_source_blocked(fx)
+    def assert_awaiting(self, fx, pr_number):
+        before = fx.fork_refs()
+        calls_from = len(fx.gh.calls)
+        for dry_run in (False, True):
+            res = fx.run(latest="1.2.0", dry_run=dry_run)
+            self.assertEqual(res.action, "awaiting-review")
+            self.assertEqual(res.pr_number, pr_number)
+            self.assertIn(f"PR #{pr_number}", res.message)
+            self.assertEqual(res.patches, [])
+            self.assertIn("awaiting-review", sf.plan_text(FORK_CFG, res))
+        self.assertEqual(fx.fork_refs(), before)
+        writes = {"sync", "create_pr", "create_comment", "edit_pr_body", "edit_comment"}
+        self.assertFalse([c for c in fx.gh.calls[calls_from:] if c[0] in writes])
 
-    def test_conflicted_partial_rebase_is_not_a_trusted_source(self):
+    def test_open_previous_rebase_waits_for_review_without_error(self):
+        fx = self.make(extra_upstream_tags=("1.2.0",))
+        fx.run(latest="1.1.0")  # rebase/1.1.0 is now an open PR
+        self.assert_awaiting(fx, pr_number=1)
+
+    def test_conflicted_partial_rebase_waits_for_review_without_error(self):
         fx = self.make(conflict=True, extra_upstream_tags=("1.2.0",))
         first = fx.run(latest="1.1.0")
         self.assertTrue(first.draft)
-        self.assert_source_blocked(fx)
+        self.assert_awaiting(fx, pr_number=1)
 
     def test_raw_vds_baseline_without_pr_or_rebase_is_ambiguous(self):
         fx = self.make(extra_upstream_tags=("1.2.0",))
@@ -480,6 +534,160 @@ class TestPatchSourceTrust(Base):
         self.assertTrue(all(p.status == "applied" for p in res.patches))
 
 
+UP_MAC = "https://github.com/skiptools/skip/releases/download/1.9.19/skip-macos.zip"
+UP_LINUX = "https://github.com/skiptools/skip/releases/download/1.9.19/skip-linux.zip"
+UP_DEP = '.package(url: "https://github.com/skiptools/skipstone.git", exact: "1.9.19")'
+VDS_MAC = "https://github.com/vindhyadatascience/skipstone/releases/download/1.9.19-vds.2/skip-macos.zip"
+VDS_LINUX = "https://github.com/vindhyadatascience/skipstone/releases/download/1.9.19-vds.2/skip-linux.zip"
+SKIPSTONE_REV = '.package(url: "https://github.com/vindhyadatascience/skipstone.git", revision: "{}")'
+DEFAULT_EXECUTABLE = '.product(name: "SkipBuild", package: "skipstone")'
+
+
+def skip_package(mac, linux, dep, mac_sum="aa", linux_sum="bb", executable=DEFAULT_EXECUTABLE):
+    """The shape of skip's Package.swift: a binaryTarget per platform and the skipstone dependency."""
+    return (
+        "    #if os(macOS)\n"
+        f'    package.targets += [.binaryTarget(name: "skip", url: "{mac}", checksum: "{mac_sum}")]\n'
+        "    #elseif os(Linux)\n"
+        f'    package.targets += [.binaryTarget(name: "skip", url: "{linux}", checksum: "{linux_sum}")]\n'
+        "    #else\n"
+        f"    package.dependencies += [{dep}]\n"
+        f'    package.targets += [.executableTarget(name: "skip", dependencies: [{executable}])]\n'
+        "    #endif\n")
+
+
+class SkipWrapperStamps(unittest.TestCase):
+    """Skip wrapper commits shaped like our VDS pins: stamps are regenerated, never applied."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="sfs-skip-")
+        self.addCleanup(shutil.rmtree, self.root, True)
+        git(self.root, "init", "-q", "-b", "main")
+        commit(self.root, "upstream 1.9.19", {"Package.swift": skip_package(UP_MAC, UP_LINUX, UP_DEP),
+                                              "README.md": "upstream readme\n"})
+        git(self.root, "tag", "1.9.19")
+        self.g = sf.Git(self.root, ENV)
+
+    def classify(self, sha):
+        return sf.classify_patch(self.g, sf.FORKS["skip"], sha, "1.9.20")
+
+    def test_pin_commit_is_stamp_only(self):
+        sha = commit(self.root, "Pin every compiler platform to VDS 1.9.19-vds.2", {
+            "Package.swift": skip_package(VDS_MAC, VDS_LINUX, SKIPSTONE_REV.format("63c9a5cd"), "cc", "dd")})
+        p = self.classify(sha)
+        self.assertTrue(p.stamp_only)
+        self.assertFalse(p.has_pins)
+        self.assertEqual(p.stamp_paths, ["Package.swift"])
+        self.assertEqual(len(p.stamp_how), 2)  # binaryTarget rule + skipstone dependency rule
+        self.assertTrue(any("skip-linux.zip" in h for h in p.stamp_how))
+        self.assertTrue(any("revision:" in h for h in p.stamp_how))
+
+    def test_revision_to_revision_pin_is_stamp_only(self):
+        commit(self.root, "pin vds.2", {"Package.swift": skip_package(
+            VDS_MAC, VDS_LINUX, SKIPSTONE_REV.format("1111"), "cc", "dd")})
+        sha = commit(self.root, "pin vds.3", {"Package.swift": skip_package(
+            VDS_MAC.replace("vds.2", "vds.3"), VDS_LINUX.replace("vds.2", "vds.3"),
+            SKIPSTONE_REV.format("2222"), "ee", "ff")})
+        p = self.classify(sha)
+        self.assertTrue(p.stamp_only)
+        self.assertFalse(p.has_pins)
+
+    def test_linux_binary_target_alone_is_stamp_only(self):
+        sha = commit(self.root, "linux only", {"Package.swift": skip_package(UP_MAC, VDS_LINUX, UP_DEP, linux_sum="ee")})
+        self.assertTrue(self.classify(sha).stamp_only)
+
+    def test_pin_commit_that_also_changes_readme_is_partial(self):
+        sha = commit(self.root, "pin and readme", {
+            "Package.swift": skip_package(VDS_MAC, VDS_LINUX, SKIPSTONE_REV.format("63c9a5cd"), "cc", "dd"),
+            "README.md": "Fork note.\n\nupstream readme\n"})
+        p = self.classify(sha)
+        self.assertFalse(p.stamp_only)
+        self.assertFalse(p.has_pins)
+        self.assertEqual(p.stamp_paths, ["Package.swift"])
+        self.assertEqual(len(p.stamp_how), 2)
+
+    def test_code_change_that_also_touches_a_pin_stays_a_patch(self):
+        executable = DEFAULT_EXECUTABLE + ', .product(name: "Extra", package: "x")'
+        sha = commit(self.root, "code and pin", {"Package.swift": skip_package(
+            VDS_MAC, VDS_LINUX, SKIPSTONE_REV.format("63c9a5cd"), "cc", "dd", executable=executable)})
+        p = self.classify(sha)
+        self.assertFalse(p.stamp_only)
+        self.assertTrue(p.has_pins)
+        self.assertEqual(p.stamp_paths, [])
+        self.assertEqual(p.stamp_how, [])
+
+    def test_other_fork_pin_is_flagged_not_treated_as_stamp(self):
+        dep = '.package(url: "https://github.com/vindhyadatascience/skip-lib.git", revision: "3333")'
+        sha = commit(self.root, "skip-lib pin", {"Package.swift": skip_package(UP_MAC, UP_LINUX, dep)})
+        p = self.classify(sha)
+        self.assertFalse(p.stamp_only)
+        self.assertTrue(p.has_pins)
+        self.assertEqual(p.stamp_paths, [])
+
+    def partial_pin_on_new_upstream(self, upstream_readme):
+        pin = commit(self.root, "Pin and readme", {
+            "Package.swift": skip_package(VDS_MAC, VDS_LINUX, SKIPSTONE_REV.format("63c9a5cd"), "cc", "dd"),
+            "README.md": "Fork note.\n\nupstream readme\n",
+            "Extra.txt": "extra\n"})
+        git(self.root, "checkout", "-q", "1.9.19")
+        commit(self.root, "upstream 1.9.20", {
+            "Package.swift": skip_package(UP_MAC.replace("1.9.19", "1.9.20"), UP_LINUX.replace("1.9.19", "1.9.20"),
+                                          UP_DEP.replace("1.9.19", "1.9.20")),
+            "README.md": upstream_readme})
+        git(self.root, "tag", "1.9.20")
+        git(self.root, "checkout", "-q", "-B", "rebase/1.9.20", "1.9.20")
+        return pin
+
+    def test_partial_pin_applies_readme_and_keeps_upstream_stamps(self):
+        pin = self.partial_pin_on_new_upstream("upstream readme\n")
+        p = self.classify(pin)
+        sf.try_pick(self.g, p)
+        self.assertEqual(p.status, "applied")
+        self.assertEqual(git(self.root, "show", "HEAD:README.md"), "Fork note.\n\nupstream readme")
+        self.assertEqual(git(self.root, "show", "HEAD:Extra.txt"), "extra")
+        self.assertEqual(git(self.root, "show", "HEAD:Package.swift"), git(self.root, "show", "1.9.20:Package.swift"))
+        self.assertEqual(git(self.root, "log", "-1", "--format=%s"), "Pin and readme")
+        self.assertIn(pin, sf.cherry_picked_from(self.g, "1.9.20..HEAD"))
+
+    def test_partial_pin_conflict_on_readme_leaves_tree_untouched(self):
+        pin = self.partial_pin_on_new_upstream("upstream readme changed upstream\n")
+        head = git(self.root, "rev-parse", "HEAD")
+        p = self.classify(pin)
+        sf.try_pick(self.g, p)
+        self.assertEqual(p.status, "conflict")
+        self.assertEqual(p.files, ["README.md"])  # Extra.txt applies cleanly, so it is not listed
+        self.assertEqual(git(self.root, "rev-parse", "HEAD"), head)
+        self.assertEqual(git(self.root, "status", "--porcelain"), "")
+
+
+class TestExitStatus(Base):
+    """main(): awaiting-review exits 0; an error (closed-unmerged upgrade PR) still exits nonzero."""
+
+    def run_main(self, fx, latest):
+        fx.gh.latest = latest
+        out = io.StringIO()
+        with mock.patch.dict(sf.FORKS, {"skipstone": FORK_CFG}), \
+                mock.patch.object(sf, "GitHub", lambda token=None: fx.gh), \
+                contextlib.redirect_stdout(out):
+            rc = sf.main(["--fork", "skipstone", "--dry-run", "--workdir", os.path.join(fx.root, "scratch")])
+        return rc, out.getvalue()
+
+    def test_open_upgrade_pr_exits_zero_with_awaiting_status(self):
+        fx = self.make(extra_upstream_tags=("1.2.0",))
+        fx.run(latest="1.1.0")
+        rc, text = self.run_main(fx, "1.2.0")
+        self.assertEqual(rc, 0)
+        self.assertIn("== skipstone (fork/skipstone): awaiting-review", text)
+
+    def test_closed_unmerged_upgrade_pr_still_exits_nonzero(self):
+        fx = self.make(extra_upstream_tags=("1.2.0",))
+        fx.run(latest="1.1.0")
+        fx.gh.prs[0]["state"] = "CLOSED"
+        rc, text = self.run_main(fx, "1.2.0")
+        self.assertEqual(rc, 1)
+        self.assertIn("== skipstone (fork/skipstone): error", text)
+
+
 class TestPinGuidance(unittest.TestCase):
     def result(self):
         return sf.Result(fork="fixture", upstream_tag="1.5.0", new_branch="vds/1.5.0",
@@ -492,6 +700,13 @@ class TestPinGuidance(unittest.TestCase):
             self.assertIn("peels to the reviewed source commit", text)
             self.assertIn("never clear fingerprints", text)
             self.assertNotIn('.exact(', text)
+
+    def test_regenerate_steps_are_listed_once_per_rule(self):
+        how = sf.FORKS["skip"].stamp_rules[0].how.format(new="1.9.20", sep="+vds.")
+        res = self.result()
+        res.patches = [sf.Patch(sha="a" * 40, subject="x", stamp_only=True, stamp_how=[how]),
+                       sf.Patch(sha="b" * 40, subject="y", stamp_only=True, stamp_how=[how])]
+        self.assertEqual(sf.manual_steps(sf.FORKS["skip"], res).count("point the macOS and Linux"), 1)
 
     def test_skip_ui_keeps_exact_prerelease_version_guidance(self):
         text = sf.manual_steps(sf.FORKS["skip-ui"], self.result())

@@ -45,8 +45,9 @@ changes survive but code patches still conflict or are missing, the result is `b
 command exits nonzero without remote writes; resolve the reported queue manually.
 
 A newer release must not use an unfinished upgrade's raw `vds/<version>` base as its patch source.
-The bot refuses a source whose previous rebase is open, closed without merging, or orphaned without
-an accepted merged PR. Acceptance must name that source branch as `baseRefName` and provide a
+The bot refuses a source whose previous rebase is closed without merging, or orphaned without an
+accepted merged PR. A previous rebase that is still an open PR is **awaiting-review**: the run names
+that PR, writes nothing for the fork, and exits 0 until the PR is merged. Acceptance must name that source branch as `baseRefName` and provide a
 merge commit that is an ancestor of the selected source; missing provenance fails closed.
 A source identical to its upstream base is also ambiguous and requires review. Finish and review that upgrade first; the bot neither substitutes a partial `rebase/*`
 branch nor silently skips back to an older patch queue. Original patched VDS source branches and
@@ -56,7 +57,12 @@ Patches that only change version stamps are not cherry-picked, because their val
 the new version. They are listed as **regenerate after build**:
 
 - skipstone: `skipVersion` in `Sources/SkipSyntax/Version.swift`;
-- skip: the macOS `binaryTarget` url/checksum in `Package.swift`.
+- skip: the macOS and Linux `binaryTarget` url/checksum, and the skipstone dependency's `revision:`
+  (or upstream's `exact:`), in `Package.swift`.
+
+A commit that changes stamp files and other files (skip's pin commits can also carry a README note) is
+applied without its stamp files: the other changes are kept, and the stamps are regenerated. skipstone
+and skip opt in (`partial_stamps`); skip-ui, skip-foundation and skip-lib still cherry-pick whole commits.
 
 Patches that change a VDS version pin alongside code (for example skip-foundation's `Package.swift`
 pointing at our skip-lib release) are applied and flagged for review.
@@ -146,9 +152,11 @@ python3 -m unittest discover -s tests -v
 2. Merge into `vds/<new>` with a merge commit or rebase (do not squash: one commit per patch).
 3. Regenerate the stamps the PR lists:
    - skipstone: set `skipVersion` to `"<new>-vds.N"` on `vds/<new>`.
-   - skip: after the skipstone `<new>-vds.N` release is published, point the macOS `binaryTarget` at
-     `https://github.com/vindhyadatascience/skipstone/releases/download/<new>-vds.N/skip-macos.zip` and
-     set `checksum` to the SHA-256 in that release's `skip-macos.zip.sha256`.
+   - skip: after the skipstone `<new>-vds.N` release is published, point the macOS and Linux
+     `binaryTarget`s at that release's `skip-macos.zip` and `skip-linux.zip`
+     (`https://github.com/vindhyadatascience/skipstone/releases/download/<new>-vds.N/...`), set each
+     `checksum` to the SHA-256 in the matching `.sha256` file, and point the skipstone dependency at the
+     `<new>-vds.N` tag's commit with `revision:`.
    - any fork pinning another fork (skip-foundation -> skip-lib) : bump the pin if that fork got a
      new release.
 4. Tag and release:
